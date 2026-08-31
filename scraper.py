@@ -197,27 +197,29 @@ def save_price(product_id, retailer_id, price, product_url):
 
 def extract_product_urls_from_category(scraper, cat_url):
     found_urls = set()
-    try:
-        res = scraper.get(cat_url, timeout=15)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, "html.parser")
-            
-            # HTML Linkleri
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if any(k in href for k in ["-p-", "/p/", "urun", "product", ".html", "-pr-", "/pr/"]) and not href.startswith("javascript"):
-                    if href.startswith("/"):
-                        base = "/".join(cat_url.split("/")[:3])
-                        href = base + href
-                    found_urls.add(href)
-            
-            # Sayfaya gömülü JSON / Script içi linkler (Dinamik siteler için)
-            script_urls = re.findall(r'https?://[^\s"\'<>]+(?:-p-|-pr-|/p/|/pr/|urun)[^\s"\'<>]*', res.text)
-            for u in script_urls:
-                found_urls.add(u)
-
-    except Exception as e:
-        print(f"Kategori Hatasi ({cat_url}): {e}")
+    # Her kategorinin ilk 5 sayfasını derinlemesine tarar
+    for page in range(1, 6):
+        try:
+            page_url = f"{cat_url}?page={page}" if "?" not in cat_url else f"{cat_url}&page={page}"
+            res = scraper.get(page_url, timeout=15)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.text, "html.parser")
+                
+                for a in soup.find_all("a", href=True):
+                    href = a["href"]
+                    if any(k in href for k in ["-p-", "/p/", "urun", "product", ".html", "-pr-", "/pr/"]) and not href.startswith("javascript"):
+                        if href.startswith("/"):
+                            base = "/".join(cat_url.split("/")[:3])
+                            href = base + href
+                        found_urls.add(href)
+                
+                script_urls = re.findall(r'https?://[^\s"\'<>]+(?:-p-|-pr-|/p/|/pr/|urun)[^\s"\'<>]*', res.text)
+                for u in script_urls:
+                    found_urls.add(u)
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"Kategori Hatasi ({cat_url} - Sayfa {page}): {e}")
+            break
     return list(found_urls)
 
 def process_store(store):
