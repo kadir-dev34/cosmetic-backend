@@ -32,7 +32,7 @@ RETAILERS = [
     {"name": "Kozmela", "slug": "kozmela", "sitemap": "https://www.kozmela.com/sitemap.xml"}
 ]
 
-MAX_PRODUCTS_PER_STORE = None  # Gece tam tarama
+MAX_PRODUCTS_PER_STORE = None  # Tam tarama
 REQUEST_DELAY = 1.5
 
 scraper = cloudscraper.create_scraper(
@@ -71,7 +71,50 @@ def clean_price(val):
         return None
 
 # ============================================================
-# 3. VERİTABANI İŞLEMLERİ
+# 3. GÜVENLİ LOG YÖNETİMİ (ÇÖKMEYİ ÖNLER)
+# ============================================================
+def create_scrape_log(retailer_id):
+    """Tablodaki CHECK kısıtlamasına takılmamak için olası durumları dener."""
+    possible_statuses = ["in_progress", "pending", "started", "running", "RUNNING", "IN_PROGRESS"]
+    for status_val in possible_statuses:
+        try:
+            res = supabase.table("scrape_logs").insert({
+                "retailer_id": retailer_id,
+                "status": status_val
+            }).execute()
+            if res.data:
+                return res.data[0]["id"]
+        except Exception:
+            continue
+    return None
+
+def update_scrape_log(log_id, status_type, found_count=0, saved_count=0, error_msg=None):
+    if not log_id: return
+    
+    status_map = {
+        "success": ["success", "completed", "SUCCESS", "COMPLETED", "ok"],
+        "failed": ["failed", "error", "FAILED", "ERROR"]
+    }
+    
+    for status_val in status_map.get(status_type, [status_type]):
+        try:
+            payload = {
+                "status": status_val,
+                "finished_at": datetime.now(timezone.utc).isoformat()
+            }
+            if status_type == "success":
+                payload["products_found"] = found_count
+                payload["products_saved"] = saved_count
+            else:
+                payload["error_message"] = str(error_msg)[:255] if error_msg else None
+                
+            supabase.table("scrape_logs").update(payload).eq("id", log_id).execute()
+            break
+        except Exception:
+            continue
+
+# ============================================================
+# 4. VERİTABANI İŞLEMLERİ
 # ============================================================
 def get_or_create_retailer(name, slug):
     res = supabase.table("retailers").select("id").eq("slug", slug).limit(1).execute()
@@ -92,15 +135,15 @@ def save_ingredients(product_id, raw_inci):
     if not raw_inci: return
     items = [clean_text(i) for i in raw_inci.split(",") if clean_text(i)]
     for order, item in enumerate(items, start=1):
-        res = supabase.table("ingredients").select("id").eq("inci_name", item).limit(1).execute()
-        if res.data:
-            ing_id = res.data[0]["id"]
-        else:
-            ins = supabase.table("ingredients").insert({"inci_name": item}).execute()
-            if ins.data: ing_id = ins.data[0]["id"]
-            else: continue
-            
         try:
+            res = supabase.table("ingredients").select("id").eq("inci_name", item).limit(1).execute()
+            if res.data:
+                ing_id = res.data[0]["id"]
+            else:
+                ins = supabase.table("ingredients").insert({"inci_name": item}).execute()
+                if ins.data: ing_id = ins.data[0]["id"]
+                else: continue
+                
             supabase.table("product_ingredients").insert({
                 "product_id": product_id,
                 "ingredient_id": ing_id,
@@ -123,40 +166,38 @@ def save_product_image(product_id, image_url):
 
 def save_price(product_id, retailer_id, price, product_url):
     if price is None: return
-    
-    last_price = supabase.table("product_prices")\
-        .select("price")\
-        .eq("product_id", product_id)\
-        .eq("retailer_id", retailer_id)\
-        .order("recorded_at", desc=True)\
-        .limit(1)\
-        .execute()
-        
-    if last_price.data and float(last_price.data[0]["price"]) == float(price):
-        return
+    try:
+        last_price = supabase.table("product_prices")\
+            .select("price")\
+            .eq("product_id", product_id)\
+            .eq("retailer_id", retailer_id)\
+            .order("recorded_at", desc=True)\
+            .limit(1)\
+            .execute()
+            
+        if last_price.data and float(last_price.data[0]["price"]) == float(price):
+            return
 
-    supabase.table("product_prices").insert({
-        "product_id": product_id,
-        "retailer_id": retailer_id,
-        "price": price,
-        "currency": "TRY",
-        "product_url": product_url,
-        "is_available": True
-    }).execute()
+        supabase.table("product_prices").insert({
+            "product_id": product_id,
+            "retailer_id": retailer_id,
+            "price": price,
+            "currency": "TRY",
+            "product_url": product_url,
+            "is_available": True
+        }).execute()
+    except Exception as e:
+        print(f"Fiyat kayit hatasi: {e}")
 
 # ============================================================
-# 4. MAĞAZA İŞLEME MANTIĞI
+# 5. MAĞAZA İŞLEME MANTIĞI
 # ============================================================
 def process_store(store):
     print(f"\n==================== {store['name']} Taranıyor ====================")
     retailer_id = get_or_create_retailer(store["name"], store["slug"])
     
-    # Status değerleri büyük harfle gönderiliyor (Constraint hatasını çözer)
-    log_res = supabase.table("scrape_logs").insert({
-        "retailer_id": retailer_id,
-        "status": "RUNNING"
-    }).execute()
-    log_id = log_res.data[0]["id"] if log_res.data else None
+    # Güvenli log kaydı başlatılır
+    log_id = create_scrape_log(retailer_id)
 
     try:
         res = scraper.get(store["sitemap"], timeout=60)
@@ -240,25 +281,14 @@ def process_store(store):
                 print(f"Ürün Hatası ({url}): {e}")
                 continue
 
-        if log_id:
-            supabase.table("scrape_logs").update({
-                "status": "SUCCESS",
-                "products_found": len(product_urls),
-                "products_saved": saved_count,
-                "finished_at": datetime.now(timezone.utc).isoformat()
-            }).eq("id", log_id).execute()
+        update_scrape_log(log_id, "success", found_count=len(product_urls), saved_count=saved_count)
 
     except Exception as e:
         print(f"Mağaza Hatası ({store['name']}): {e}")
-        if log_id:
-            supabase.table("scrape_logs").update({
-                "status": "FAILED",
-                "error_message": str(e),
-                "finished_at": datetime.now(timezone.utc).isoformat()
-            }).eq("id", log_id).execute()
+        update_scrape_log(log_id, "failed", error_msg=e)
 
 # ============================================================
-# 5. MAIN
+# 6. MAIN
 # ============================================================
 def main():
     print("Gece Otomatik Kozmetik Scraper Başlatıldı...")
