@@ -16,7 +16,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
-    raise ValueError("SUPABASE_URL veya SUPABASE_SECRET_KEY bulunamadi! .env / Secrets ayarlarini kontrol edin.")
+    raise ValueError("SUPABASE_URL veya SUPABASE_SECRET_KEY bulunamadi!")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
@@ -32,8 +32,9 @@ RETAILERS = [
     {"name": "Kozmela", "slug": "kozmela", "sitemap": "https://www.kozmela.com/sitemap.xml"}
 ]
 
-MAX_PRODUCTS_PER_STORE = None  # Tam tarama
-REQUEST_DELAY = 1.5
+# Her mağazadan ilk etapta hızlıca 50'şer ürün çekerek 8 mağazanın da çalıştığını doğrulayalım
+MAX_PRODUCTS_PER_STORE = 50 
+REQUEST_DELAY = 0.5  # İstek arası bekleme 0.5 sn'ye indirildi (Hızlandırma)
 
 scraper = cloudscraper.create_scraper(
     browser={"browser": "chrome", "platform": "windows", "mobile": False}
@@ -43,9 +44,6 @@ scraper.headers.update({
     "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
 })
 
-# ============================================================
-# 2. YARDIMCI FONKSİYONLAR
-# ============================================================
 def clean_text(val):
     if not val: return None
     val = str(val).replace("\xa0", " ").replace("\u200b", "").replace("\ufeff", "")
@@ -70,11 +68,7 @@ def clean_price(val):
     except ValueError:
         return None
 
-# ============================================================
-# 3. GÜVENLİ LOG YÖNETİMİ (ÇÖKMEYİ ÖNLER)
-# ============================================================
 def create_scrape_log(retailer_id):
-    """Tablodaki CHECK kısıtlamasına takılmamak için olası durumları dener."""
     possible_statuses = ["in_progress", "pending", "started", "running", "RUNNING", "IN_PROGRESS"]
     for status_val in possible_statuses:
         try:
@@ -82,20 +76,17 @@ def create_scrape_log(retailer_id):
                 "retailer_id": retailer_id,
                 "status": status_val
             }).execute()
-            if res.data:
-                return res.data[0]["id"]
+            if res.data: return res.data[0]["id"]
         except Exception:
             continue
     return None
 
 def update_scrape_log(log_id, status_type, found_count=0, saved_count=0, error_msg=None):
     if not log_id: return
-    
     status_map = {
         "success": ["success", "completed", "SUCCESS", "COMPLETED", "ok"],
         "failed": ["failed", "error", "FAILED", "ERROR"]
     }
-    
     for status_val in status_map.get(status_type, [status_type]):
         try:
             payload = {
@@ -107,15 +98,11 @@ def update_scrape_log(log_id, status_type, found_count=0, saved_count=0, error_m
                 payload["products_saved"] = saved_count
             else:
                 payload["error_message"] = str(error_msg)[:255] if error_msg else None
-                
             supabase.table("scrape_logs").update(payload).eq("id", log_id).execute()
             break
         except Exception:
             continue
 
-# ============================================================
-# 4. VERİTABANI İŞLEMLERİ
-# ============================================================
 def get_or_create_retailer(name, slug):
     res = supabase.table("retailers").select("id").eq("slug", slug).limit(1).execute()
     if res.data: return res.data[0]["id"]
@@ -137,13 +124,7 @@ def save_ingredients(product_id, raw_inci):
     for order, item in enumerate(items, start=1):
         try:
             res = supabase.table("ingredients").select("id").eq("inci_name", item).limit(1).execute()
-            if res.data:
-                ing_id = res.data[0]["id"]
-            else:
-                ins = supabase.table("ingredients").insert({"inci_name": item}).execute()
-                if ins.data: ing_id = ins.data[0]["id"]
-                else: continue
-                
+            ing_id = res.data[0]["id"] if res.data else supabase.table("ingredients").insert({"inci_name": item}).execute().data[0]["id"]
             supabase.table("product_ingredients").insert({
                 "product_id": product_id,
                 "ingredient_id": ing_id,
@@ -189,30 +170,29 @@ def save_price(product_id, retailer_id, price, product_url):
     except Exception as e:
         print(f"Fiyat kayit hatasi: {e}")
 
-# ============================================================
-# 5. MAĞAZA İŞLEME MANTIĞI
-# ============================================================
 def process_store(store):
     print(f"\n==================== {store['name']} Taranıyor ====================")
     retailer_id = get_or_create_retailer(store["name"], store["slug"])
-    
-    # Güvenli log kaydı başlatılır
     log_id = create_scrape_log(retailer_id)
 
     try:
-        res = scraper.get(store["sitemap"], timeout=60)
+        res = scraper.get(store["sitemap"], timeout=15)
         urls = list(set(re.findall(r"<loc>(https?://[^<]+)</loc>", res.text)))
         product_urls = [u for u in urls if "-p-" in u or "/p/" in u or "urun" in u or "product" in u]
         
+        if not product_urls:
+            print(f"{store['name']} sitemap'te doğrudan ürün linki bulunamadı, ana sayfa deneniyor...")
+            product_urls = urls[:MAX_PRODUCTS_PER_STORE]
+
         if MAX_PRODUCTS_PER_STORE:
             product_urls = product_urls[:MAX_PRODUCTS_PER_STORE]
 
-        print(f"Bulunan Toplam Ürün Sayısı: {len(product_urls)}")
+        print(f"[{store['name']}] Taranacak Ürün Sayısı: {len(product_urls)}")
         saved_count = 0
         
         for idx, url in enumerate(product_urls, start=1):
             try:
-                p_res = scraper.get(url, timeout=30)
+                p_res = scraper.get(url, timeout=10)
                 soup = BeautifulSoup(p_res.text, "html.parser")
                 
                 h1 = soup.select_one("h1")
@@ -225,22 +205,17 @@ def process_store(store):
 
                 price = None
                 price_el = soup.select_one("[class*='price'], [itemprop='price']")
-                if price_el:
-                    price = clean_price(price_el.get_text())
+                if price_el: price = clean_price(price_el.get_text())
 
                 img_el = soup.select_one("meta[property='og:image']")
                 image_url = img_el.get("content") if img_el else None
 
                 category = "Kozmetik"
                 lower_name = name.lower()
-                if any(w in lower_name for w in ["krem", "nemlendirici", "serum", "tonik", "temizleyici"]):
-                    category = "Cilt Bakımı"
-                elif any(w in lower_name for w in ["parfüm", "edt", "edp", "deodorant"]):
-                    category = "Parfüm"
-                elif any(w in lower_name for w in ["şampuan", "saç kremi", "maske", "saç yağ"]):
-                    category = "Saç Bakımı"
-                elif any(w in lower_name for w in ["ruj", "fondöten", "maskara", "allık", "kapatıcı"]):
-                    category = "Makyaj"
+                if any(w in lower_name for w in ["krem", "nemlendirici", "serum", "tonik", "temizleyici"]): category = "Cilt Bakımı"
+                elif any(w in lower_name for w in ["parfüm", "edt", "edp", "deodorant"]): category = "Parfüm"
+                elif any(w in lower_name for w in ["şampuan", "saç kremi", "maske", "saç yağ"]): category = "Saç Bakımı"
+                elif any(w in lower_name for w in ["ruj", "fondöten", "maskara", "allık", "kapatıcı"]): category = "Makyaj"
 
                 inci_text = None
                 for el in soup.find_all(["div", "p", "span"]):
@@ -275,10 +250,9 @@ def process_store(store):
                 save_price(product_id, retailer_id, price, url)
 
                 saved_count += 1
-                print(f"[{idx}/{len(product_urls)}] İşlendi: {name[:30]}... | {price} TL")
+                print(f"[{store['name']}] [{idx}/{len(product_urls)}] İşlendi: {name[:25]}... | {price} TL")
                 time.sleep(REQUEST_DELAY)
             except Exception as e:
-                print(f"Ürün Hatası ({url}): {e}")
                 continue
 
         update_scrape_log(log_id, "success", found_count=len(product_urls), saved_count=saved_count)
@@ -287,13 +261,14 @@ def process_store(store):
         print(f"Mağaza Hatası ({store['name']}): {e}")
         update_scrape_log(log_id, "failed", error_msg=e)
 
-# ============================================================
-# 6. MAIN
-# ============================================================
 def main():
     print("Gece Otomatik Kozmetik Scraper Başlatıldı...")
     for store in RETAILERS:
-        process_store(store)
+        try:
+            process_store(store)
+        except Exception as e:
+            print(f"{store['name']} taranırken genel hata atlandı: {e}")
+            continue
     print("\nTüm Mağazaların Taranması Tamamlandı!")
 
 if __name__ == "__main__":
