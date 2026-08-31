@@ -194,6 +194,58 @@ def save_price(product_id, retailer_id, price, product_url):
     except Exception:
         pass
 
+def try_sitemap_urls(scraper, base_domain, stats):
+    """
+    Kategori sayfalarini tahmin etmek yerine, once sitenin sitemap.xml'ini
+    dener. Cogu ciddi e-ticaret sitesi SEO icin TUM urun URL'lerini sitemap'te
+    yayinlar - bu hem kategori/sayfalama tahmini gerektirmez hem de kategori
+    bazli taramanin kacirdigi urunleri de yakalar.
+    Basarili olursa urun-benzeri URL listesi doner, olmazsa bos liste doner
+    (bu durumda cagiran taraf eski kategori tarama yontemine devam eder).
+    """
+    candidate_paths = ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/sitemap/sitemap.xml"]
+    product_url_pattern = re.compile(r"-p-|/p/|-pr-|/pr/|urun|product", re.IGNORECASE)
+    found_urls = set()
+
+    for path in candidate_paths:
+        try:
+            res = scraper.get(base_domain + path, timeout=12)
+            stats["status_codes"][f"sitemap:{res.status_code}"] = stats["status_codes"].get(f"sitemap:{res.status_code}", 0) + 1
+            if res.status_code != 200 or "xml" not in res.headers.get("Content-Type", "").lower():
+                continue
+
+            # Sitemap index ise (alt sitemap'lere link veriyorsa) once onlari topla
+            sub_sitemaps = re.findall(r"<loc>([^<]+\.xml[^<]*)</loc>", res.text)
+            locs = re.findall(r"<loc>([^<]+)</loc>", res.text)
+
+            # Dogrudan urun sayfasi gibi gorunen loc'lari al
+            for loc in locs:
+                if loc not in sub_sitemaps and product_url_pattern.search(loc):
+                    found_urls.add(loc)
+
+            # Eger bu bir sitemap index ise, urun/kategori icerebilecek alt
+            # sitemap'leri (en fazla 15 tanesini, asiri istek atmamak icin) gez
+            relevant_sub = [s for s in sub_sitemaps if re.search(r"product|urun|category|kategori", s, re.IGNORECASE)] or sub_sitemaps[:15]
+            for sub_url in relevant_sub[:15]:
+                try:
+                    sub_res = scraper.get(sub_url, timeout=12)
+                    stats["status_codes"][f"sitemap:{sub_res.status_code}"] = stats["status_codes"].get(f"sitemap:{sub_res.status_code}", 0) + 1
+                    if sub_res.status_code == 200:
+                        sub_locs = re.findall(r"<loc>([^<]+)</loc>", sub_res.text)
+                        for loc in sub_locs:
+                            if product_url_pattern.search(loc):
+                                found_urls.add(loc)
+                    time.sleep(0.3)
+                except Exception:
+                    continue
+
+            if found_urls:
+                break  # bu sitemap yolu calisti, digerlerini denemeye gerek yok
+        except Exception:
+            continue
+
+    return list(found_urls)
+
 def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param="page", max_pages=15):
     """
     Kategori sayfalarini gezerek urun linklerini toplar.
@@ -316,12 +368,27 @@ def process_store(store):
     pagination_param = store.get("pagination_param", "page")
     max_pages = store.get("max_pages", 15)
 
-    product_urls = set()
-    for cat_url in store["start_urls"]:
-        urls = extract_product_urls_from_category(scraper, cat_url, stats, pagination_param, max_pages)
-        print(f"[{store['name']}] {cat_url} -> {len(urls)} link bulundu")
-        for u in urls:
-            product_urls.add(u)
+    # 1. ONCE: sitemap.xml uzerinden tum urun URL'lerini bulmayi dene.
+    #    Basarili olursa kategori tahmini/sayfalama sorunlariyla ugrasmaya gerek kalmaz.
+    base_domain = "https://" + store["start_urls"][0].split("/")[2]
+    product_urls = set(try_sitemap_urls(scraper, base_domain, stats))
+
+    if product_urls:
+        print(f"[{store['name']}] Sitemap uzerinden {len(product_urls)} urun linki bulundu (kategori taramasi atlaniyor)")
+        # Guvenlik siniri: sitemap tum siteyi (kozmetik disi urunler dahil) icerebilir.
+        # Asiri buyukse (workflow'un zaman asimina ugramamasi icin) ust sinir koyulur.
+        MAX_PRODUCTS_PER_STORE = 3000
+        if len(product_urls) > MAX_PRODUCTS_PER_STORE:
+            print(f"[{store['name']}] UYARI: {len(product_urls)} link cok fazla, ilk {MAX_PRODUCTS_PER_STORE} tanesi islenecek")
+            product_urls = set(list(product_urls)[:MAX_PRODUCTS_PER_STORE])
+    else:
+        # 2. SITEMAP YOKSA/BOSSA: eski yontem - kategori sayfalarini gez
+        print(f"[{store['name']}] Sitemap bulunamadi, kategori sayfalari taranacak")
+        for cat_url in store["start_urls"]:
+            urls = extract_product_urls_from_category(scraper, cat_url, stats, pagination_param, max_pages)
+            print(f"[{store['name']}] {cat_url} -> {len(urls)} link bulundu")
+            for u in urls:
+                product_urls.add(u)
 
     product_urls = list(product_urls)
     print(f"[{store['name']}] Bulunan Urun Linki Sayisi: {len(product_urls)}")
