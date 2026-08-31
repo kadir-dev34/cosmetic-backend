@@ -20,11 +20,11 @@ if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
-# 8 Mağaza Yapılandırması
+# 8 Mağaza ve Doğrudan Ürün İçeren Sitemap Linkleri
 RETAILERS = [
     {"name": "Gratis", "slug": "gratis", "sitemap": "https://www.gratis.com/sitemap.xml"},
-    {"name": "Watsons", "slug": "watsons", "sitemap": "https://www.watsons.com.tr/sitemap.xml"},
-    {"name": "Sephora", "slug": "sephora", "sitemap": "https://www.sephora.com.tr/sitemap.xml"},
+    {"name": "Watsons", "slug": "watsons", "sitemap": "https://www.watsons.com.tr/sitemap/sitemap_products1.xml"},
+    {"name": "Sephora", "slug": "sephora", "sitemap": "https://www.sephora.com.tr/sitemap_products.xml"},
     {"name": "Sevil Parfümeri", "slug": "sevil", "sitemap": "https://www.sevil.com.tr/sitemap.xml"},
     {"name": "Boyner Beauty", "slug": "boyner", "sitemap": "https://www.boyner.com.tr/sitemap.xml"},
     {"name": "Rossmann", "slug": "rossmann", "sitemap": "https://www.rossmann.com.tr/sitemap.xml"},
@@ -32,9 +32,8 @@ RETAILERS = [
     {"name": "Kozmela", "slug": "kozmela", "sitemap": "https://www.kozmela.com/sitemap.xml"}
 ]
 
-# Her mağazadan ilk etapta hızlıca 50'şer ürün çekerek 8 mağazanın da çalıştığını doğrulayalım
-MAX_PRODUCTS_PER_STORE = 50 
-REQUEST_DELAY = 0.5  # İstek arası bekleme 0.5 sn'ye indirildi (Hızlandırma)
+MAX_PRODUCTS_PER_STORE = 15  # Test icin her magazadan 15'er urun (Hizli dogrulama)
+REQUEST_DELAY = 1.0
 
 scraper = cloudscraper.create_scraper(
     browser={"browser": "chrome", "platform": "windows", "mobile": False}
@@ -176,29 +175,35 @@ def process_store(store):
     log_id = create_scrape_log(retailer_id)
 
     try:
+        # 1. Sitemap Alma (Timeout Koruma)
         res = scraper.get(store["sitemap"], timeout=15)
+        if res.status_code != 200:
+            print(f"[{store['name']}] Sitemap erisilemedi. Status: {res.status_code}")
+            update_scrape_log(log_id, "failed", error_msg=f"HTTP {res.status_code}")
+            return
+
         urls = list(set(re.findall(r"<loc>(https?://[^<]+)</loc>", res.text)))
-        product_urls = [u for u in urls if "-p-" in u or "/p/" in u or "urun" in u or "product" in u]
-        
+        product_urls = [u for u in urls if "-p-" in u or "/p/" in u or "urun" in u or "product" in u or ".html" in u]
+
         if not product_urls:
-            print(f"{store['name']} sitemap'te doğrudan ürün linki bulunamadı, ana sayfa deneniyor...")
-            product_urls = urls[:MAX_PRODUCTS_PER_STORE]
+            product_urls = [u for u in urls if not u.endswith(".xml") and len(u) > 25]
 
         if MAX_PRODUCTS_PER_STORE:
             product_urls = product_urls[:MAX_PRODUCTS_PER_STORE]
 
-        print(f"[{store['name']}] Taranacak Ürün Sayısı: {len(product_urls)}")
+        print(f"[{store['name']}] Bulunan Ürün Linki Sayısı: {len(product_urls)}")
         saved_count = 0
-        
+
         for idx, url in enumerate(product_urls, start=1):
             try:
                 p_res = scraper.get(url, timeout=10)
+                if p_res.status_code != 200: continue
                 soup = BeautifulSoup(p_res.text, "html.parser")
-                
+
                 h1 = soup.select_one("h1")
                 if not h1: continue
                 name = clean_text(h1.get_text())
-                
+
                 brand_el = soup.select_one("[class*='brand'], [itemprop='brand']")
                 brand_name = clean_text(brand_el.get_text()) if brand_el else "Genel"
                 brand_id = get_or_create_brand(brand_name)
@@ -230,7 +235,7 @@ def process_store(store):
 
                 slug = make_slug(name)
                 existing = supabase.table("products").select("id").eq("slug", slug).limit(1).execute()
-                
+
                 if existing.data:
                     product_id = existing.data[0]["id"]
                 else:
@@ -250,9 +255,10 @@ def process_store(store):
                 save_price(product_id, retailer_id, price, url)
 
                 saved_count += 1
-                print(f"[{store['name']}] [{idx}/{len(product_urls)}] İşlendi: {name[:25]}... | {price} TL")
+                print(f"[{store['name']}] [{idx}/{len(product_urls)}] Eklendi: {name[:20]}... | {price} TL")
                 time.sleep(REQUEST_DELAY)
             except Exception as e:
+                print(f"[{store['name']}] Urun Hatasi ({url}): {e}")
                 continue
 
         update_scrape_log(log_id, "success", found_count=len(product_urls), saved_count=saved_count)
@@ -267,7 +273,7 @@ def main():
         try:
             process_store(store)
         except Exception as e:
-            print(f"{store['name']} taranırken genel hata atlandı: {e}")
+            print(f"{store['name']} genel hata atlandı: {e}")
             continue
     print("\nTüm Mağazaların Taranması Tamamlandı!")
 
