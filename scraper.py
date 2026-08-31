@@ -2,7 +2,6 @@ import os
 import re
 import time
 import random
-import json
 from datetime import datetime, timezone
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -22,86 +21,50 @@ if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
-# 8 Mağaza ve Genişletilmiş Kategori/API Linkleri
 RETAILERS = [
     {
         "name": "Gratis", 
         "slug": "gratis", 
-        "start_urls": [
-            "https://www.gratis.com/makyaj-c-100",
-            "https://www.gratis.com/cilt-bakim-c-200",
-            "https://www.gratis.com/sac-bakim-c-300",
-            "https://www.gratis.com/parfum-deodorant-c-400"
-        ]
+        "start_urls": ["https://www.gratis.com/makyaj-c-100", "https://www.gratis.com/cilt-bakim-c-200"]
     },
     {
         "name": "Watsons", 
         "slug": "watsons", 
-        "start_urls": [
-            "https://www.watsons.com.tr/cilt-bakim/c/1010",
-            "https://www.watsons.com.tr/makyaj/c/1000",
-            "https://www.watsons.com.tr/sac-bakim/c/1020",
-            "https://www.watsons.com.tr/parfum/c/1040"
-        ]
+        "start_urls": ["https://www.watsons.com.tr/cilt-bakim/c/1010", "https://www.watsons.com.tr/makyaj/c/1000"]
     },
     {
         "name": "Sephora", 
         "slug": "sephora", 
-        "start_urls": [
-            "https://www.sephora.com.tr/shop/makyaj-c302/",
-            "https://www.sephora.com.tr/shop/cilt-bakim-c303/",
-            "https://www.sephora.com.tr/shop/parfum-c301/"
-        ]
+        "start_urls": ["https://www.sephora.com.tr/shop/makyaj-c302/", "https://www.sephora.com.tr/shop/cilt-bakim-c303/"]
     },
     {
         "name": "Sevil Parfümeri", 
         "slug": "sevil", 
-        "start_urls": [
-            "https://www.sevil.com.tr/parfum.html",
-            "https://www.sevil.com.tr/makyaj.html",
-            "https://www.sevil.com.tr/cilt-bakimi.html"
-        ]
+        "start_urls": ["https://www.sevil.com.tr/parfum.html", "https://www.sevil.com.tr/cilt-bakimi.html"]
     },
     {
         "name": "Boyner Beauty", 
         "slug": "boyner", 
-        "start_urls": [
-            "https://www.boyner.com.tr/kozmetik-c-10",
-            "https://www.boyner.com.tr/parfum-c-1001",
-            "https://www.boyner.com.tr/cilt-bakim-c-1002"
-        ]
+        "start_urls": ["https://www.boyner.com.tr/kozmetik-c-10", "https://www.boyner.com.tr/parfum-c-1001"]
     },
     {
         "name": "Rossmann", 
         "slug": "rossmann", 
-        "start_urls": [
-            "https://www.rossmann.com.tr/makyaj-c-101",
-            "https://www.rossmann.com.tr/cilt-bakimi-c-102",
-            "https://www.rossmann.com.tr/sac-bakimi-c-103"
-        ]
+        "start_urls": ["https://www.rossmann.com.tr/makyaj-c-101", "https://www.rossmann.com.tr/cilt-bakimi-c-102"]
     },
     {
         "name": "Eve Shop", 
         "slug": "eveshop", 
-        "start_urls": [
-            "https://www.eveshop.com.tr/makyaj",
-            "https://www.eveshop.com.tr/cilt-bakimi",
-            "https://www.eveshop.com.tr/parfum"
-        ]
+        "start_urls": ["https://www.eveshop.com.tr/makyaj", "https://www.eveshop.com.tr/cilt-bakimi"]
     },
     {
         "name": "Kozmela", 
         "slug": "kozmela", 
-        "start_urls": [
-            "https://www.kozmela.com/cilt-bakimi",
-            "https://www.kozmela.com/makyaj",
-            "https://www.kozmela.com/parfum"
-        ]
+        "start_urls": ["https://www.kozmela.com/cilt-bakimi", "https://www.kozmela.com/makyaj"]
     }
 ]
 
-MAX_PRODUCTS_PER_STORE = None  # Tam tarama modu (Limit kaldırıldı)
-REQUEST_DELAY = 1.0
+REQUEST_DELAY = 1.2
 
 def get_scraper():
     s = cloudscraper.create_scraper(
@@ -197,14 +160,12 @@ def save_price(product_id, retailer_id, price, product_url):
 
 def extract_product_urls_from_category(scraper, cat_url):
     found_urls = set()
-    # Her kategorinin ilk 5 sayfasını derinlemesine tarar
-    for page in range(1, 6):
+    for page in range(1, 4):
         try:
             page_url = f"{cat_url}?page={page}" if "?" not in cat_url else f"{cat_url}&page={page}"
-            res = scraper.get(page_url, timeout=15)
+            res = scraper.get(page_url, timeout=12)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, "html.parser")
-                
                 for a in soup.find_all("a", href=True):
                     href = a["href"]
                     if any(k in href for k in ["-p-", "/p/", "urun", "product", ".html", "-pr-", "/pr/"]) and not href.startswith("javascript"):
@@ -217,10 +178,64 @@ def extract_product_urls_from_category(scraper, cat_url):
                 for u in script_urls:
                     found_urls.add(u)
             time.sleep(0.5)
-        except Exception as e:
-            print(f"Kategori Hatasi ({cat_url} - Sayfa {page}): {e}")
+        except Exception:
             break
     return list(found_urls)
+
+def parse_product_page(soup, p_res):
+    """Mağazaya özel esnek ürün adı, marka ve fiyat çıkarma."""
+    # Ürün Adı
+    name = None
+    h1 = soup.select_one("h1, .product-name, [class*='product-title'], [class*='title']")
+    if h1: name = clean_text(h1.get_text())
+    
+    if not name:
+        meta_title = soup.select_one("meta[property='og:title']")
+        if meta_title: name = clean_text(meta_title.get("content"))
+
+    if not name: return None, None, None, None, None
+
+    # Marka
+    brand_name = "Genel"
+    brand_el = soup.select_one("[class*='brand'], [itemprop='brand'], .product-brand")
+    if brand_el: 
+        brand_name = clean_text(brand_el.get_text())
+    else:
+        # İsmin ilk kelimesinden marka çıkarma tahmini
+        parts = name.split()
+        if len(parts) > 1: brand_name = parts[0]
+
+    # Fiyat
+    price = None
+    price_el = soup.select_one("[class*='price'], [itemprop='price'], .current-price, .discount-price, span[data-price]")
+    if price_el:
+        price = clean_price(price_el.get_text())
+
+    if not price:
+        # HTML içindeki TL kalıplarını arama
+        matches = re.findall(r'(\d+[\.,]?\d*)\s*(?:TL|₺)', p_res.text)
+        if matches:
+            for m in matches:
+                p = clean_price(m)
+                if p and p > 5:
+                    price = p
+                    break
+
+    # Görsel
+    img_el = soup.select_one("meta[property='og:image'], [class*='product-image'] img")
+    image_url = None
+    if img_el:
+        image_url = img_el.get("content") or img_el.get("src")
+
+    # INCI Maddeleri
+    inci_text = None
+    for el in soup.find_all(["div", "p", "span", "section"]):
+        txt = el.get_text()
+        if ("İçindekiler" in txt or "Ingredients" in txt) and len(txt) > 30 and "," in txt:
+            inci_text = clean_text(txt.replace("İçindekiler:", "").replace("Ingredients:", ""))
+            break
+
+    return name, brand_name, price, image_url, inci_text
 
 def process_store(store):
     print(f"\n==================== {store['name']} Taranıyor ====================")
@@ -234,7 +249,7 @@ def process_store(store):
             product_urls.add(u)
 
     product_urls = list(product_urls)
-    print(f"[{store['name']}] Bulunan Toplam Urun Linki Sayisi: {len(product_urls)}")
+    print(f"[{store['name']}] Bulunan Urun Linki Sayisi: {len(product_urls)}")
     saved_count = 0
 
     for idx, url in enumerate(product_urls, start=1):
@@ -243,20 +258,10 @@ def process_store(store):
             if p_res.status_code != 200: continue
             soup = BeautifulSoup(p_res.text, "html.parser")
 
-            h1 = soup.select_one("h1")
-            if not h1: continue
-            name = clean_text(h1.get_text())
+            name, brand_name, price, image_url, inci_text = parse_product_page(soup, p_res)
+            if not name: continue
 
-            brand_el = soup.select_one("[class*='brand'], [itemprop='brand']")
-            brand_name = clean_text(brand_el.get_text()) if brand_el else "Genel"
             brand_id = get_or_create_brand(brand_name)
-
-            price = None
-            price_el = soup.select_one("[class*='price'], [itemprop='price']")
-            if price_el: price = clean_price(price_el.get_text())
-
-            img_el = soup.select_one("meta[property='og:image']")
-            image_url = img_el.get("content") if img_el else None
 
             category = "Kozmetik"
             lower_name = name.lower()
@@ -264,13 +269,6 @@ def process_store(store):
             elif any(w in lower_name for w in ["parfüm", "edt", "edp", "deodorant"]): category = "Parfüm"
             elif any(w in lower_name for w in ["şampuan", "saç kremi", "maske", "saç yağ"]): category = "Saç Bakımı"
             elif any(w in lower_name for w in ["ruj", "fondöten", "maskara", "allık", "kapatıcı"]): category = "Makyaj"
-
-            inci_text = None
-            for el in soup.find_all(["div", "p", "span"]):
-                txt = el.get_text()
-                if ("İçindekiler" in txt or "Ingredients" in txt) and len(txt) > 30 and "," in txt:
-                    inci_text = clean_text(txt.replace("İçindekiler:", "").replace("Ingredients:", ""))
-                    break
 
             barcode = None
             bc_match = re.search(r"\b\d{13}\b", p_res.text)
@@ -302,7 +300,8 @@ def process_store(store):
                 print(f"[{store['name']}] [{idx}/{len(product_urls)}] Eklendi: {name[:20]}... | {price} TL")
 
             time.sleep(REQUEST_DELAY)
-        except Exception:
+        except Exception as e:
+            print(f"[{store['name']}] Hata: {e}")
             continue
 
 def main():
@@ -310,7 +309,9 @@ def main():
     for store in RETAILERS:
         try:
             process_store(store)
-        except Exception:
+            time.sleep(3)  # Mağazalar arası 3 saniye dinlenme (Ban koruması)
+        except Exception as e:
+            print(f"{store['name']} atlandı: {e}")
             continue
     print("\nTüm Mağazaların Taranması Tamamlandı!")
 
