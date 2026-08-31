@@ -21,46 +21,70 @@ if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
+# Her mağaza için "pagination_param": site sayfalamayı hangi query parametresiyle
+# yapıyor (bazıları ?page=N, bazıları ?p=N kullanıyor). "max_pages": kaç sayfaya
+# kadar denenecek üst sınır - boş/tekrar eden sayfa gelirse zaten otomatik durulur.
 RETAILERS = [
     {
         "name": "Gratis",
         "slug": "gratis",
-        "start_urls": ["https://www.gratis.com/makyaj-c-100", "https://www.gratis.com/cilt-bakim-c-200"]
+        "start_urls": ["https://www.gratis.com/makyaj-c-100", "https://www.gratis.com/cilt-bakim-c-200"],
+        "pagination_param": "page",
+        "max_pages": 15
     },
     {
         "name": "Watsons",
         "slug": "watsons",
-        "start_urls": ["https://www.watsons.com.tr/cilt-bakim/c/1010", "https://www.watsons.com.tr/makyaj/c/1000"]
+        # Duzeltilmis kategori ID'leri (eskisi 1010/1000 hatali idi -> 101/100)
+        "start_urls": ["https://www.watsons.com.tr/cilt-bakim/c/101", "https://www.watsons.com.tr/makyaj/c/100"],
+        "pagination_param": "page",
+        "max_pages": 15
     },
     {
         "name": "Sephora",
         "slug": "sephora",
-        "start_urls": ["https://www.sephora.com.tr/shop/makyaj-c302/", "https://www.sephora.com.tr/shop/cilt-bakim-c303/"]
+        # "/shop/" onekı hatali idi, gercek yapida yok
+        "start_urls": ["https://www.sephora.com.tr/makyaj-c302/", "https://www.sephora.com.tr/cilt-bakim-c303/"],
+        "pagination_param": "page",
+        "max_pages": 15
     },
     {
         "name": "Sevil Parfümeri",
         "slug": "sevil",
-        "start_urls": ["https://www.sevil.com.tr/parfum.html", "https://www.sevil.com.tr/cilt-bakimi.html"]
+        # ".html" uzantisi gercek sitede yok
+        "start_urls": ["https://www.sevil.com.tr/parfum", "https://www.sevil.com.tr/cilt-vucut-sac-bakimi", "https://www.sevil.com.tr/makyaj"],
+        "pagination_param": "page",
+        "max_pages": 15
     },
     {
         "name": "Boyner Beauty",
         "slug": "boyner",
-        "start_urls": ["https://www.boyner.com.tr/kozmetik-c-10", "https://www.boyner.com.tr/parfum-c-1001"]
+        "start_urls": ["https://www.boyner.com.tr/kozmetik-c-10", "https://www.boyner.com.tr/parfum-c-1001"],
+        "pagination_param": "page",
+        "max_pages": 15
     },
     {
         "name": "Rossmann",
         "slug": "rossmann",
-        "start_urls": ["https://www.rossmann.com.tr/makyaj-c-101", "https://www.rossmann.com.tr/cilt-bakimi-c-102"]
+        # "-c-101" gibi ID'li url'ler gercek sitede yok, kategori duz isimle
+        "start_urls": ["https://www.rossmann.com.tr/makyaj", "https://www.rossmann.com.tr/cilt-bakimi"],
+        "pagination_param": "p",  # Rossmann ?p=N kullaniyor, ?page=N degil
+        "max_pages": 15
     },
     {
         "name": "Eve Shop",
         "slug": "eveshop",
-        "start_urls": ["https://www.eveshop.com.tr/makyaj", "https://www.eveshop.com.tr/cilt-bakimi"]
+        # Eve Shop Shopify tabanli, kategoriler /collections/ altinda
+        "start_urls": ["https://www.eveshop.com.tr/makyaj", "https://www.eveshop.com.tr/collections/cilt-bakimi"],
+        "pagination_param": "page",
+        "max_pages": 15
     },
     {
         "name": "Kozmela",
         "slug": "kozmela",
-        "start_urls": ["https://www.kozmela.com/cilt-bakimi", "https://www.kozmela.com/makyaj"]
+        "start_urls": ["https://www.kozmela.com/cilt-bakimi", "https://www.kozmela.com/makyaj"],
+        "pagination_param": "page",
+        "max_pages": 15
     }
 ]
 
@@ -170,29 +194,55 @@ def save_price(product_id, retailer_id, price, product_url):
     except Exception:
         pass
 
-def extract_product_urls_from_category(scraper, cat_url, stats):
+def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param="page", max_pages=15):
+    """
+    Kategori sayfalarini gezerek urun linklerini toplar.
+    - pagination_param: magazaya gore degisen sayfalama sorgu parametresi (page/p/vb.)
+    - max_pages: ust sinir; bir sayfada YENI urun linki bulunamazsa (once bulunanlarla
+      ayni kumeyse) veya sayfa 404/hata donerse dongu erken sonlandirilir, boylece
+      kucuk kataloglarda gereksiz istek atilmaz, buyuk kataloglarda ise tum sayfalar taranir.
+    """
     found_urls = set()
-    for page in range(1, 4):
+    consecutive_empty = 0
+
+    for page in range(1, max_pages + 1):
         try:
-            page_url = f"{cat_url}?page={page}" if "?" not in cat_url else f"{cat_url}&page={page}"
+            sep = "&" if "?" in cat_url else "?"
+            page_url = cat_url if page == 1 else f"{cat_url}{sep}{pagination_param}={page}"
             res = scraper.get(page_url, timeout=12)
             stats["status_codes"][res.status_code] = stats["status_codes"].get(res.status_code, 0) + 1
-            if res.status_code == 200:
-                soup = BeautifulSoup(res.text, "html.parser")
-                for a in soup.find_all("a", href=True):
-                    href = a["href"]
-                    if any(k in href for k in ["-p-", "/p/", "urun", "product", ".html", "-pr-", "/pr/"]) and not href.startswith("javascript"):
-                        if href.startswith("/"):
-                            base = "/".join(cat_url.split("/")[:3])
-                            href = base + href
-                        found_urls.add(href)
 
-                script_urls = re.findall(r'https?://[^\s"\'<>]+(?:-p-|-pr-|/p/|/pr/|urun)[^\s"\'<>]*', res.text)
-                for u in script_urls:
-                    found_urls.add(u)
+            if res.status_code != 200:
+                break
+
+            before_count = len(found_urls)
+            soup = BeautifulSoup(res.text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if any(k in href for k in ["-p-", "/p/", "urun", "product", ".html", "-pr-", "/pr/", "/collections/"]) and not href.startswith("javascript"):
+                    if href.startswith("/"):
+                        base = "/".join(cat_url.split("/")[:3])
+                        href = base + href
+                    found_urls.add(href)
+
+            script_urls = re.findall(r'https?://[^\s"\'<>]+(?:-p-|-pr-|/p/|/pr/|urun)[^\s"\'<>]*', res.text)
+            for u in script_urls:
+                found_urls.add(u)
+
+            new_count = len(found_urls) - before_count
+            if new_count == 0:
+                consecutive_empty += 1
+                # Bir sayfa hic yeni link getirmediyse (kategori bitti ya da
+                # sayfalama parametresi sitede etkisiz) 2 sayfa daha deneyip durur.
+                if consecutive_empty >= 2:
+                    break
+            else:
+                consecutive_empty = 0
+
             time.sleep(0.5)
         except Exception:
             break
+
     return list(found_urls)
 
 def parse_product_page(soup, p_res):
@@ -263,9 +313,13 @@ def process_store(store):
 
     stats = {"status_codes": {}, "new_products": 0, "updated_prices": 0, "skipped": 0}
 
+    pagination_param = store.get("pagination_param", "page")
+    max_pages = store.get("max_pages", 15)
+
     product_urls = set()
     for cat_url in store["start_urls"]:
-        urls = extract_product_urls_from_category(scraper, cat_url, stats)
+        urls = extract_product_urls_from_category(scraper, cat_url, stats, pagination_param, max_pages)
+        print(f"[{store['name']}] {cat_url} -> {len(urls)} link bulundu")
         for u in urls:
             product_urls.add(u)
 
