@@ -37,7 +37,7 @@ RETAILERS = [
         "slug": "watsons",
         # Duzeltilmis kategori ID'leri (eskisi 1010/1000 hatali idi -> 101/100)
         "start_urls": ["https://www.watsons.com.tr/cilt-bakim/c/101", "https://www.watsons.com.tr/makyaj/c/100"],
-        "pagination_param": "page",
+        "pagination_param": "currentPage",  # Watsons "page" degil "currentPage" kullaniyor
         "max_pages": 15
     },
     {
