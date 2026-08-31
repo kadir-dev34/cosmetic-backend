@@ -2,6 +2,7 @@ import os
 import re
 import time
 import random
+import json
 from datetime import datetime, timezone
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -21,7 +22,7 @@ if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
-# 8 Mağaza ve Çalışan Direkt Kategori / Ürün Sayfa Linkleri
+# 8 Mağaza ve Genişletilmiş Kategori/API Linkleri
 RETAILERS = [
     {
         "name": "Gratis", 
@@ -39,7 +40,8 @@ RETAILERS = [
         "start_urls": [
             "https://www.watsons.com.tr/cilt-bakim/c/1010",
             "https://www.watsons.com.tr/makyaj/c/1000",
-            "https://www.watsons.com.tr/sac-bakim/c/1020"
+            "https://www.watsons.com.tr/sac-bakim/c/1020",
+            "https://www.watsons.com.tr/parfum/c/1040"
         ]
     },
     {
@@ -65,7 +67,8 @@ RETAILERS = [
         "slug": "boyner", 
         "start_urls": [
             "https://www.boyner.com.tr/kozmetik-c-10",
-            "https://www.boyner.com.tr/parfum-c-1001"
+            "https://www.boyner.com.tr/parfum-c-1001",
+            "https://www.boyner.com.tr/cilt-bakim-c-1002"
         ]
     },
     {
@@ -73,7 +76,8 @@ RETAILERS = [
         "slug": "rossmann", 
         "start_urls": [
             "https://www.rossmann.com.tr/makyaj-c-101",
-            "https://www.rossmann.com.tr/cilt-bakimi-c-102"
+            "https://www.rossmann.com.tr/cilt-bakimi-c-102",
+            "https://www.rossmann.com.tr/sac-bakimi-c-103"
         ]
     },
     {
@@ -81,7 +85,8 @@ RETAILERS = [
         "slug": "eveshop", 
         "start_urls": [
             "https://www.eveshop.com.tr/makyaj",
-            "https://www.eveshop.com.tr/cilt-bakimi"
+            "https://www.eveshop.com.tr/cilt-bakimi",
+            "https://www.eveshop.com.tr/parfum"
         ]
     },
     {
@@ -89,12 +94,13 @@ RETAILERS = [
         "slug": "kozmela", 
         "start_urls": [
             "https://www.kozmela.com/cilt-bakimi",
-            "https://www.kozmela.com/makyaj"
+            "https://www.kozmela.com/makyaj",
+            "https://www.kozmela.com/parfum"
         ]
     }
 ]
 
-MAX_PRODUCTS_PER_STORE = 10  # Test için her mağazadan ilk 10 ürün
+MAX_PRODUCTS_PER_STORE = None  # Tam tarama modu (Limit kaldırıldı)
 REQUEST_DELAY = 1.0
 
 def get_scraper():
@@ -104,15 +110,7 @@ def get_scraper():
     s.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1"
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
     })
     return s
 
@@ -194,7 +192,7 @@ def save_price(product_id, retailer_id, price, product_url):
             "product_url": product_url,
             "is_available": True
         }).execute()
-    except Exception as e:
+    except Exception:
         pass
 
 def extract_product_urls_from_category(scraper, cat_url):
@@ -203,15 +201,23 @@ def extract_product_urls_from_category(scraper, cat_url):
         res = scraper.get(cat_url, timeout=15)
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, "html.parser")
+            
+            # HTML Linkleri
             for a in soup.find_all("a", href=True):
                 href = a["href"]
-                if any(k in href for k in ["-p-", "/p/", "urun", "product", ".html"]) and not href.startswith("javascript"):
+                if any(k in href for k in ["-p-", "/p/", "urun", "product", ".html", "-pr-", "/pr/"]) and not href.startswith("javascript"):
                     if href.startswith("/"):
                         base = "/".join(cat_url.split("/")[:3])
                         href = base + href
                     found_urls.add(href)
+            
+            # Sayfaya gömülü JSON / Script içi linkler (Dinamik siteler için)
+            script_urls = re.findall(r'https?://[^\s"\'<>]+(?:-p-|-pr-|/p/|/pr/|urun)[^\s"\'<>]*', res.text)
+            for u in script_urls:
+                found_urls.add(u)
+
     except Exception as e:
-        print(f"Kategori Sayfasi Hatasi ({cat_url}): {e}")
+        print(f"Kategori Hatasi ({cat_url}): {e}")
     return list(found_urls)
 
 def process_store(store):
@@ -224,13 +230,9 @@ def process_store(store):
         urls = extract_product_urls_from_category(scraper, cat_url)
         for u in urls:
             product_urls.add(u)
-            if MAX_PRODUCTS_PER_STORE and len(product_urls) >= MAX_PRODUCTS_PER_STORE:
-                break
-        if MAX_PRODUCTS_PER_STORE and len(product_urls) >= MAX_PRODUCTS_PER_STORE:
-            break
 
     product_urls = list(product_urls)
-    print(f"[{store['name']}] Bulunan Urun Linki Sayisi: {len(product_urls)}")
+    print(f"[{store['name']}] Bulunan Toplam Urun Linki Sayisi: {len(product_urls)}")
     saved_count = 0
 
     for idx, url in enumerate(product_urls, start=1):
@@ -273,8 +275,6 @@ def process_store(store):
             if bc_match: barcode = bc_match.group(0)
 
             slug = make_slug(name)
-            
-            # Benzersizleştirme (Her mağazanın fiyat kaydı yapmasını sağlar)
             unique_slug = f"{slug}-{store['slug']}"
             existing = supabase.table("products").select("id").eq("slug", unique_slug).limit(1).execute()
 
@@ -300,8 +300,7 @@ def process_store(store):
                 print(f"[{store['name']}] [{idx}/{len(product_urls)}] Eklendi: {name[:20]}... | {price} TL")
 
             time.sleep(REQUEST_DELAY)
-        except Exception as e:
-            print(f"[{store['name']}] Urun Hatasi ({url}): {e}")
+        except Exception:
             continue
 
 def main():
@@ -309,8 +308,7 @@ def main():
     for store in RETAILERS:
         try:
             process_store(store)
-        except Exception as e:
-            print(f"{store['name']} genel hatayla atlandı: {e}")
+        except Exception:
             continue
     print("\nTüm Mağazaların Taranması Tamamlandı!")
 
