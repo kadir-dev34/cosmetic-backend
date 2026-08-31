@@ -16,7 +16,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SECRET_KEY = os.getenv("SUPABASE_SECRET_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
-    raise ValueError("SUPABASE_URL veya SUPABASE_SECRET_KEY bulunamadi!")
+    raise ValueError("SUPABASE_URL veya SUPABASE_SECRET_KEY bulunamadi! .env / Secrets ayarlarini kontrol edin.")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
@@ -32,7 +32,7 @@ RETAILERS = [
     {"name": "Kozmela", "slug": "kozmela", "sitemap": "https://www.kozmela.com/sitemap.xml"}
 ]
 
-MAX_PRODUCTS_PER_STORE = None  # Tam tarama
+MAX_PRODUCTS_PER_STORE = None  # Gece tam tarama
 REQUEST_DELAY = 1.5
 
 scraper = cloudscraper.create_scraper(
@@ -43,9 +43,13 @@ scraper.headers.update({
     "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
 })
 
+# ============================================================
+# 2. YARDIMCI FONKSİYONLAR
+# ============================================================
 def clean_text(val):
     if not val: return None
-    val = re.sub(r"\s+", " ", str(val)).strip()
+    val = str(val).replace("\xa0", " ").replace("\u200b", "").replace("\ufeff", "")
+    val = re.sub(r"\s+", " ", val).strip()
     return val if val else None
 
 def make_slug(text):
@@ -66,6 +70,9 @@ def clean_price(val):
     except ValueError:
         return None
 
+# ============================================================
+# 3. VERİTABANI İŞLEMLERİ
+# ============================================================
 def get_or_create_retailer(name, slug):
     res = supabase.table("retailers").select("id").eq("slug", slug).limit(1).execute()
     if res.data: return res.data[0]["id"]
@@ -86,7 +93,13 @@ def save_ingredients(product_id, raw_inci):
     items = [clean_text(i) for i in raw_inci.split(",") if clean_text(i)]
     for order, item in enumerate(items, start=1):
         res = supabase.table("ingredients").select("id").eq("inci_name", item).limit(1).execute()
-        ing_id = res.data[0]["id"] if res.data else supabase.table("ingredients").insert({"inci_name": item}).execute().data[0]["id"]
+        if res.data:
+            ing_id = res.data[0]["id"]
+        else:
+            ins = supabase.table("ingredients").insert({"inci_name": item}).execute()
+            if ins.data: ing_id = ins.data[0]["id"]
+            else: continue
+            
         try:
             supabase.table("product_ingredients").insert({
                 "product_id": product_id,
@@ -131,13 +144,17 @@ def save_price(product_id, retailer_id, price, product_url):
         "is_available": True
     }).execute()
 
+# ============================================================
+# 4. MAĞAZA İŞLEME MANTIĞI
+# ============================================================
 def process_store(store):
     print(f"\n==================== {store['name']} Taranıyor ====================")
     retailer_id = get_or_create_retailer(store["name"], store["slug"])
     
+    # Status değerleri büyük harfle gönderiliyor (Constraint hatasını çözer)
     log_res = supabase.table("scrape_logs").insert({
         "retailer_id": retailer_id,
-        "status": "running"
+        "status": "RUNNING"
     }).execute()
     log_id = log_res.data[0]["id"] if log_res.data else None
 
@@ -225,7 +242,7 @@ def process_store(store):
 
         if log_id:
             supabase.table("scrape_logs").update({
-                "status": "success",
+                "status": "SUCCESS",
                 "products_found": len(product_urls),
                 "products_saved": saved_count,
                 "finished_at": datetime.now(timezone.utc).isoformat()
@@ -235,11 +252,14 @@ def process_store(store):
         print(f"Mağaza Hatası ({store['name']}): {e}")
         if log_id:
             supabase.table("scrape_logs").update({
-                "status": "failed",
+                "status": "FAILED",
                 "error_message": str(e),
                 "finished_at": datetime.now(timezone.utc).isoformat()
             }).eq("id", log_id).execute()
 
+# ============================================================
+# 5. MAIN
+# ============================================================
 def main():
     print("Gece Otomatik Kozmetik Scraper Başlatıldı...")
     for store in RETAILERS:
