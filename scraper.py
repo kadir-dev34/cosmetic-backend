@@ -76,10 +76,12 @@ RETAILERS = [
     {
         "name": "Eve Shop",
         "slug": "eveshop",
-        # Eve Shop Shopify tabanli, kategoriler /collections/ altinda
+        # Eve Shop bir Shopify magazasi - resmi /products.json API'si kullanilir,
+        # HTML kazima gerekmez. "platform": "shopify" bu ozel akisi tetikler.
         "start_urls": ["https://www.eveshop.com.tr/makyaj", "https://www.eveshop.com.tr/collections/cilt-bakimi"],
         "pagination_param": "page",
-        "max_pages": 15
+        "max_pages": 15,
+        "platform": "shopify"
     },
     {
         "name": "Kozmela",
@@ -361,6 +363,84 @@ def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param
 
     return list(found_urls)
 
+def fetch_shopify_products_json(scraper, base_domain, stats, max_pages=60):
+    """
+    Shopify magazalari icin resmi/genel /products.json API'sini kullanir.
+    HTML parse etmeye gerek kalmadan, TUM urunleri (isim, marka, fiyat, gorsel,
+    barkod, aciklama) tek seferde temiz JSON olarak doner. HTML kazimadan
+    (og:image, h1 tahmini vb.) cok daha guvenilir - yanlis logo/kategori-ismi
+    gibi sorunlar bu yontemde olusmaz.
+    """
+    all_products = []
+    for page in range(1, max_pages + 1):
+        url = f"{base_domain}/products.json?limit=250&page={page}"
+        try:
+            res = scraper.get(url, timeout=15)
+            stats["status_codes"][f"shopify_json:{res.status_code}"] = stats["status_codes"].get(f"shopify_json:{res.status_code}", 0) + 1
+            if res.status_code != 200:
+                break
+            data = res.json()
+            products = data.get("products", [])
+            if not products:
+                break
+            all_products.extend(products)
+            if len(products) < 250:
+                break  # son sayfaya gelindi
+            time.sleep(0.3)
+        except Exception:
+            break
+    return all_products
+
+def parse_shopify_product(product, base_domain):
+    """Shopify JSON'undan tek bir urunun alanlarini cikarir."""
+    name = clean_text(product.get("title"))
+    if not name:
+        return None
+
+    brand_name = clean_text(product.get("vendor")) or "Genel"
+
+    price = None
+    variants = product.get("variants", []) or []
+    variant_prices = [clean_price(v.get("price")) for v in variants]
+    variant_prices = [p for p in variant_prices if p]
+    if variant_prices:
+        price = min(variant_prices)
+
+    image_url = None
+    images = product.get("images", []) or []
+    if images:
+        candidate = images[0].get("src")
+        if candidate and "logo" not in candidate.lower():
+            image_url = candidate
+
+    handle = product.get("handle", "")
+    product_url = f"{base_domain}/products/{handle}"
+
+    # Barkod: Shopify'da varyantlarda dogrudan barkod alani bulunur -
+    # regex tahmini yerine gercek veri kullanilir, EAN-13 ise dogrulanir.
+    barcode = None
+    for v in variants:
+        candidate_bc = v.get("barcode")
+        if candidate_bc and is_valid_ean13(candidate_bc.strip()):
+            barcode = candidate_bc.strip()
+            break
+
+    # Icerik/INCI - urun aciklamasi (body_html) icinde aranir
+    inci_text = None
+    body_html = product.get("body_html") or ""
+    if body_html:
+        body_text = BeautifulSoup(body_html, "html.parser").get_text()
+        for marker in ["İçindekiler", "Ingredients"]:
+            idx = body_text.find(marker)
+            if idx != -1:
+                snippet = body_text[idx:idx + 2000]
+                snippet = snippet.replace("İçindekiler:", "").replace("Ingredients:", "")
+                if "," in snippet:
+                    inci_text = clean_text(snippet)
+                break
+
+    return name, brand_name, price, image_url, product_url, barcode, inci_text
+
 def parse_product_page(soup, p_res):
     """Genel/esnek urun adi, marka ve fiyat cikarma (magazaya ozel degil, ortak fallback)."""
     # Urun Adi
@@ -438,6 +518,77 @@ def parse_product_page(soup, p_res):
             break
 
     return name, brand_name, price, image_url, inci_text
+
+def process_store_shopify(store):
+    """
+    Shopify magazalari icin ozel islem akisi: HTML kazima yerine dogrudan
+    /products.json API'sinden temiz veri cekilir. Tek bir cagri seti tum
+    urun bilgilerini (isim, marka, fiyat, gorsel, barkod, aciklama) getirir -
+    ayrica her urun sayfasini tek tek ziyaret etmeye gerek kalmaz.
+    """
+    print(f"\n==================== {store['name']} Taranıyor (Shopify API) ====================")
+    scraper = get_scraper()
+    retailer_id = get_or_create_retailer(store["name"], store["slug"])
+    stats = {"status_codes": {}, "new_products": 0, "updated_prices": 0, "skipped": 0}
+
+    base_domain = "https://" + store["start_urls"][0].split("/")[2]
+    products = fetch_shopify_products_json(scraper, base_domain, stats)
+    print(f"[{store['name']}] Shopify API uzerinden {len(products)} urun bulundu")
+
+    for idx, product in enumerate(products, start=1):
+        try:
+            parsed = parse_shopify_product(product, base_domain)
+            if not parsed:
+                stats["skipped"] += 1
+                continue
+            name, brand_name, price, image_url, product_url, barcode, inci_text = parsed
+
+            brand_id = get_or_create_brand(brand_name)
+
+            category = "Kozmetik"
+            lower_name = name.lower()
+            if any(w in lower_name for w in ["krem", "nemlendirici", "serum", "tonik", "temizleyici"]): category = "Cilt Bakımı"
+            elif any(w in lower_name for w in ["parfüm", "edt", "edp", "deodorant"]): category = "Parfüm"
+            elif any(w in lower_name for w in ["şampuan", "saç kremi", "maske", "saç yağ"]): category = "Saç Bakımı"
+            elif any(w in lower_name for w in ["ruj", "fondöten", "maskara", "allık", "kapatıcı"]): category = "Makyaj"
+
+            slug = make_slug(name)
+            unique_slug = f"{slug}-{store['slug']}"
+            existing = supabase.table("products").select("id").eq("slug", unique_slug).limit(1).execute()
+            is_new_product = not existing.data
+
+            if existing.data:
+                product_id = existing.data[0]["id"]
+            else:
+                ins = supabase.table("products").insert({
+                    "brand_id": brand_id,
+                    "name": name,
+                    "slug": unique_slug,
+                    "category": category,
+                    "barcode": barcode,
+                    "image_url": image_url,
+                    "original_inci_text": inci_text
+                }).execute()
+                product_id = ins.data[0]["id"] if ins.data else None
+
+            if product_id:
+                if is_new_product:
+                    save_ingredients(product_id, inci_text)
+                    save_product_image(product_id, image_url)
+                    stats["new_products"] += 1
+                save_price(product_id, retailer_id, price, product_url)
+                stats["updated_prices"] += 1
+                tag = "YENİ" if is_new_product else "GÜNCEL"
+                print(f"[{store['name']}] [{idx}/{len(products)}] {tag}: {name[:30]}... | {price} TL")
+                if idx % 50 == 0:
+                    print(f"[{store['name']}] --- İLERLEME: {idx}/{len(products)} işlendi ---")
+        except Exception as e:
+            print(f"[{store['name']}] Hata: {e}")
+            stats["skipped"] += 1
+            continue
+
+    print(f"[{store['name']}] ÖZET -> Yeni: {stats['new_products']} | Fiyat güncellenen: {stats['updated_prices']} | Atlanan: {stats['skipped']} | Status kodları: {stats['status_codes']}")
+    return stats
 
 def process_store(store):
     print(f"\n==================== {store['name']} Taranıyor ====================")
@@ -595,7 +746,12 @@ def main():
     overall = {}
     for store in stores_to_run:
         try:
-            overall[store["name"]] = process_store(store)
+            # Shopify magazalari icin ozel API tabanli akis kullanilir,
+            # digerleri genel HTML kazima akisini kullanir.
+            if store.get("platform") == "shopify":
+                overall[store["name"]] = process_store_shopify(store)
+            else:
+                overall[store["name"]] = process_store(store)
             time.sleep(3)  # Mağazalar arası 3 saniye dinlenme (Ban koruması)
         except Exception as e:
             print(f"{store['name']} atlandı: {e}")
