@@ -184,9 +184,20 @@ def get_or_create_brand(brand_name):
     if res.data:
         _brand_cache[slug] = res.data[0]["id"]
         return _brand_cache[slug]
-    ins = supabase.table("brands").insert({"name": brand_name, "slug": slug}).execute()
-    _brand_cache[slug] = ins.data[0]["id"]
-    return _brand_cache[slug]
+
+    try:
+        ins = supabase.table("brands").insert({"name": brand_name, "slug": slug}).execute()
+        _brand_cache[slug] = ins.data[0]["id"]
+        return _brand_cache[slug]
+    except Exception:
+        # Ayni anda calisan baska bir magazanin islemi bu markayi bizden once
+        # eklemis olabilir (paralel calisma nedeniyle). Bu durumda hata vermek
+        # yerine tekrar sorgulayip mevcut kaydi kullaniriz.
+        res2 = supabase.table("brands").select("id").eq("slug", slug).limit(1).execute()
+        if res2.data:
+            _brand_cache[slug] = res2.data[0]["id"]
+            return _brand_cache[slug]
+        raise
 
 def save_ingredients(product_id, raw_inci):
     """Sadece yeni urunler icin cagrilir - tekrar calistirmada duplicate satir olusturmaz."""
@@ -198,7 +209,18 @@ def save_ingredients(product_id, raw_inci):
                 ing_id = _ingredient_cache[item]
             else:
                 res = supabase.table("ingredients").select("id").eq("inci_name", item).limit(1).execute()
-                ing_id = res.data[0]["id"] if res.data else supabase.table("ingredients").insert({"inci_name": item}).execute().data[0]["id"]
+                if res.data:
+                    ing_id = res.data[0]["id"]
+                else:
+                    try:
+                        ing_id = supabase.table("ingredients").insert({"inci_name": item}).execute().data[0]["id"]
+                    except Exception:
+                        # Ayni anda calisan baska bir magaza ayni malzemeyi eklemis
+                        # olabilir - tekrar sorgulayip mevcut kaydi kullan.
+                        res2 = supabase.table("ingredients").select("id").eq("inci_name", item).limit(1).execute()
+                        if not res2.data:
+                            raise
+                        ing_id = res2.data[0]["id"]
                 _ingredient_cache[item] = ing_id
             supabase.table("product_ingredients").insert({
                 "product_id": product_id,
