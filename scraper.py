@@ -374,6 +374,21 @@ def parse_product_page(soup, p_res):
 
     if not name: return None, None, None, None, None
 
+    # Kategori/menu sayfalarini urun sanip kaydetmeyi onlemek icin sağlamlık
+    # kontrolu: bilinen genel kategori/menu isimleri veya tek kelimelik supheli
+    # isimler gercek urun degildir, atlanir.
+    KNOWN_NON_PRODUCT_NAMES = {
+        "süpermarket", "markalar", "makyaj", "cilt bakım", "saç bakım",
+        "temizleme ürünleri", "kağıt ürünleri", "tekstil ürünleri",
+        "güneş ürünleri", "bebek banyo ürünleri", "kadın", "erkek", "bebek",
+        "kozmetik", "kız çocuk", "erkek çocuk", "parfüm", "aksesuar",
+        "kampanyalar", "indirim", "yeni ürünler", "çok satanlar"
+    }
+    name_normalized = name.strip().lower().rstrip(".")
+    word_count = len(name_normalized.split())
+    if name_normalized in KNOWN_NON_PRODUCT_NAMES or word_count <= 1:
+        return None, None, None, None, None
+
     # Marka
     brand_name = "Genel"
     brand_el = soup.select_one("[class*='brand'], [itemprop='brand'], .product-brand")
@@ -406,11 +421,13 @@ def parse_product_page(soup, p_res):
                     price = p
                     break
 
-    # Gorsel
+    # Gorsel - site logosu yanlislikla urun gorseli olarak kaydedilmesin
     img_el = soup.select_one("meta[property='og:image'], [class*='product-image'] img")
     image_url = None
     if img_el:
-        image_url = img_el.get("content") or img_el.get("src")
+        candidate = img_el.get("content") or img_el.get("src")
+        if candidate and "logo" not in candidate.lower():
+            image_url = candidate
 
     # INCI Maddeleri
     inci_text = None
