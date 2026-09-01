@@ -2,7 +2,9 @@ import os
 import re
 import time
 import random
+import threading
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import cloudscraper
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -88,7 +90,7 @@ RETAILERS = [
     }
 ]
 
-REQUEST_DELAY = 1.2
+CONCURRENT_WORKERS = 6  # Ayni anda kac urun sayfasi indirilecek (paralel indirme)
 
 def get_scraper():
     s = cloudscraper.create_scraper(
@@ -100,6 +102,29 @@ def get_scraper():
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
     })
     return s
+
+# Her thread kendi cloudscraper oturumunu kullanir (paylasilan tek oturumun
+# es zamanli isteklerde beklenmedik hatalara yol acmasini onlemek icin).
+_thread_local = threading.local()
+
+def get_thread_scraper():
+    if not hasattr(_thread_local, "scraper"):
+        _thread_local.scraper = get_scraper()
+    return _thread_local.scraper
+
+def fetch_product_page(url):
+    """Paralel calisan worker'larin cagirdigi fonksiyon: bir urun sayfasini indirir.
+    Kucuk rastgele bir gecikme (jitter) icerir - bu, 6 paralel worker'in bile
+    tamamen bosluksuz/robotik bir istek paterni olusturmasini engeller ve
+    bot korumasi sistemlerinin (Cloudflare, WAF vb.) "burst" trafigi olarak
+    isaretleme riskini azaltir. Hizin buyuk kismi (paralellikten gelen) korunur."""
+    time.sleep(random.uniform(0.3, 0.7))
+    try:
+        scraper = get_thread_scraper()
+        res = scraper.get(url, timeout=12)
+        return url, res, None
+    except Exception as e:
+        return url, None, str(e)
 
 def clean_text(val):
     if not val: return None
@@ -375,12 +400,23 @@ def process_store(store):
 
     if product_urls:
         print(f"[{store['name']}] Sitemap uzerinden {len(product_urls)} urun linki bulundu (kategori taramasi atlaniyor)")
-        # Guvenlik siniri: sitemap tum siteyi (kozmetik disi urunler dahil) icerebilir.
-        # Asiri buyukse (workflow'un zaman asimina ugramamasi icin) ust sinir koyulur.
-        MAX_PRODUCTS_PER_STORE = 3000
+        # Paralel indirme sayesinde artik tek calistirmada cok daha fazla urun
+        # islenebiliyor. Bu sadece asiri uc durumlar (sitemap'in kozmetik disi
+        # binlerce urun icermesi gibi) icin bir güvenlik agi - normalde devreye girmez.
+        MAX_PRODUCTS_PER_STORE = 20000
         if len(product_urls) > MAX_PRODUCTS_PER_STORE:
-            print(f"[{store['name']}] UYARI: {len(product_urls)} link cok fazla, ilk {MAX_PRODUCTS_PER_STORE} tanesi islenecek")
-            product_urls = set(list(product_urls)[:MAX_PRODUCTS_PER_STORE])
+            sorted_urls = sorted(product_urls)
+            total = len(sorted_urls)
+            day_index = datetime.now(timezone.utc).timetuple().tm_yday
+            start = (day_index * MAX_PRODUCTS_PER_STORE) % total
+            end = start + MAX_PRODUCTS_PER_STORE
+            if end <= total:
+                chunk = sorted_urls[start:end]
+            else:
+                chunk = sorted_urls[start:] + sorted_urls[:end - total]
+            nights_to_cover_all = -(-total // MAX_PRODUCTS_PER_STORE)
+            print(f"[{store['name']}] UYARI: {total} link var, bu calistirmada {MAX_PRODUCTS_PER_STORE} tanesi islenecek. Tum katalog ~{nights_to_cover_all} calistirmada taranir.")
+            product_urls = set(chunk)
     else:
         # 2. SITEMAP YOKSA/BOSSA: eski yontem - kategori sayfalarini gez
         print(f"[{store['name']}] Sitemap bulunamadi, kategori sayfalari taranacak")
@@ -393,75 +429,90 @@ def process_store(store):
     product_urls = list(product_urls)
     print(f"[{store['name']}] Bulunan Urun Linki Sayisi: {len(product_urls)}")
 
-    for idx, url in enumerate(product_urls, start=1):
-        try:
-            p_res = scraper.get(url, timeout=12)
-            stats["status_codes"][p_res.status_code] = stats["status_codes"].get(p_res.status_code, 0) + 1
-            if p_res.status_code != 200:
+    idx = 0
+    # PARALEL INDIRME: ayni anda CONCURRENT_WORKERS kadar urun sayfasi indirilir.
+    # Indirme (network - yavas kisim) paralel yapilir; veritabani yazma islemleri
+    # ise indirmeler tamamlandikca TEK TEK (sirayla) yapilir - boylece ayni marka/
+    # malzemenin ayni anda 2 kez olusturulmasi gibi celismeler (race condition) onlenir.
+    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
+        future_to_url = {executor.submit(fetch_product_page, url): url for url in product_urls}
+
+        for future in as_completed(future_to_url):
+            url, p_res, error = future.result()
+            idx += 1
+            try:
+                if error or p_res is None:
+                    stats["skipped"] += 1
+                    continue
+
+                stats["status_codes"][p_res.status_code] = stats["status_codes"].get(p_res.status_code, 0) + 1
+                if p_res.status_code != 200:
+                    stats["skipped"] += 1
+                    continue
+                soup = BeautifulSoup(p_res.text, "html.parser")
+
+                name, brand_name, price, image_url, inci_text = parse_product_page(soup, p_res)
+                if not name:
+                    stats["skipped"] += 1
+                    continue
+
+                brand_id = get_or_create_brand(brand_name)
+
+                category = "Kozmetik"
+                lower_name = name.lower()
+                if any(w in lower_name for w in ["krem", "nemlendirici", "serum", "tonik", "temizleyici"]): category = "Cilt Bakımı"
+                elif any(w in lower_name for w in ["parfüm", "edt", "edp", "deodorant"]): category = "Parfüm"
+                elif any(w in lower_name for w in ["şampuan", "saç kremi", "maske", "saç yağ"]): category = "Saç Bakımı"
+                elif any(w in lower_name for w in ["ruj", "fondöten", "maskara", "allık", "kapatıcı"]): category = "Makyaj"
+
+                # Barkod: sadece EAN-13 checksum'ini gecen sayilar kabul edilir
+                barcode = None
+                for candidate in re.findall(r"\b\d{13}\b", p_res.text):
+                    if is_valid_ean13(candidate):
+                        barcode = candidate
+                        break
+
+                slug = make_slug(name)
+                unique_slug = f"{slug}-{store['slug']}"
+                existing = supabase.table("products").select("id").eq("slug", unique_slug).limit(1).execute()
+
+                is_new_product = not existing.data
+
+                if existing.data:
+                    product_id = existing.data[0]["id"]
+                else:
+                    ins = supabase.table("products").insert({
+                        "brand_id": brand_id,
+                        "name": name,
+                        "slug": unique_slug,
+                        "category": category,
+                        "barcode": barcode,
+                        "image_url": image_url,
+                        "original_inci_text": inci_text
+                    }).execute()
+                    product_id = ins.data[0]["id"] if ins.data else None
+
+                if product_id:
+                    # Malzeme ve gorsel sadece YENI urunlerde eklenir -> tekrar calistirmada
+                    # ayni satirlarin coklanmasi (duplicate) onlenir.
+                    if is_new_product:
+                        save_ingredients(product_id, inci_text)
+                        save_product_image(product_id, image_url)
+                        stats["new_products"] += 1
+
+                    # Fiyat her calistirmada eklenir -> fiyat gecmisi bilincli olarak birikir.
+                    save_price(product_id, retailer_id, price, url)
+                    stats["updated_prices"] += 1
+                    tag = "YENİ" if is_new_product else "GÜNCEL"
+                    print(f"[{store['name']}] [{idx}/{len(product_urls)}] {tag}: {name[:30]}... | {price} TL")
+                    # Her 50 uruncte bir ilerleme ozeti - workflow'un takilip takilmadigini
+                    # (veya sadece yavas oldugunu) loglardan anlik takip edebilmek icin.
+                    if idx % 50 == 0:
+                        print(f"[{store['name']}] --- İLERLEME: {idx}/{len(product_urls)} işlendi ---")
+            except Exception as e:
+                print(f"[{store['name']}] Hata: {e}")
                 stats["skipped"] += 1
                 continue
-            soup = BeautifulSoup(p_res.text, "html.parser")
-
-            name, brand_name, price, image_url, inci_text = parse_product_page(soup, p_res)
-            if not name:
-                stats["skipped"] += 1
-                continue
-
-            brand_id = get_or_create_brand(brand_name)
-
-            category = "Kozmetik"
-            lower_name = name.lower()
-            if any(w in lower_name for w in ["krem", "nemlendirici", "serum", "tonik", "temizleyici"]): category = "Cilt Bakımı"
-            elif any(w in lower_name for w in ["parfüm", "edt", "edp", "deodorant"]): category = "Parfüm"
-            elif any(w in lower_name for w in ["şampuan", "saç kremi", "maske", "saç yağ"]): category = "Saç Bakımı"
-            elif any(w in lower_name for w in ["ruj", "fondöten", "maskara", "allık", "kapatıcı"]): category = "Makyaj"
-
-            # Barkod: sadece EAN-13 checksum'ini gecen sayilar kabul edilir
-            barcode = None
-            for candidate in re.findall(r"\b\d{13}\b", p_res.text):
-                if is_valid_ean13(candidate):
-                    barcode = candidate
-                    break
-
-            slug = make_slug(name)
-            unique_slug = f"{slug}-{store['slug']}"
-            existing = supabase.table("products").select("id").eq("slug", unique_slug).limit(1).execute()
-
-            is_new_product = not existing.data
-
-            if existing.data:
-                product_id = existing.data[0]["id"]
-            else:
-                ins = supabase.table("products").insert({
-                    "brand_id": brand_id,
-                    "name": name,
-                    "slug": unique_slug,
-                    "category": category,
-                    "barcode": barcode,
-                    "image_url": image_url,
-                    "original_inci_text": inci_text
-                }).execute()
-                product_id = ins.data[0]["id"] if ins.data else None
-
-            if product_id:
-                # Malzeme ve gorsel sadece YENI urunlerde eklenir -> tekrar calistirmada
-                # ayni satirlarin coklanmasi (duplicate) onlenir.
-                if is_new_product:
-                    save_ingredients(product_id, inci_text)
-                    save_product_image(product_id, image_url)
-                    stats["new_products"] += 1
-
-                # Fiyat her calistirmada eklenir -> fiyat gecmisi bilincli olarak birikir.
-                save_price(product_id, retailer_id, price, url)
-                stats["updated_prices"] += 1
-                tag = "YENİ" if is_new_product else "GÜNCEL"
-                print(f"[{store['name']}] [{idx}/{len(product_urls)}] {tag}: {name[:30]}... | {price} TL")
-
-            time.sleep(REQUEST_DELAY)
-        except Exception as e:
-            print(f"[{store['name']}] Hata: {e}")
-            stats["skipped"] += 1
-            continue
 
     print(f"[{store['name']}] ÖZET -> Yeni: {stats['new_products']} | Fiyat güncellenen: {stats['updated_prices']} | Atlanan: {stats['skipped']} | Status kodları: {stats['status_codes']}")
     return stats
