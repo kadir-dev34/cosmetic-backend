@@ -166,14 +166,27 @@ def get_or_create_retailer(name, slug):
     ins = supabase.table("retailers").insert({"name": name, "slug": slug}).execute()
     return ins.data[0]["id"]
 
+# Marka ve malzeme isim->id eslesmeleri bellekte tutulur, boylece ayni marka/
+# malzeme icin tekrar tekrar veritabani sorgusu atilmaz. Yazma islemleri tek
+# thread'de (ana thread) yapildigi icin bu sozlukler guvenle paylasilabilir.
+_brand_cache = {}
+_ingredient_cache = {}
+
 def get_or_create_brand(brand_name):
     if not brand_name: brand_name = "Genel"
     brand_name = clean_text(brand_name)
     slug = make_slug(brand_name)
+
+    if slug in _brand_cache:
+        return _brand_cache[slug]
+
     res = supabase.table("brands").select("id").eq("slug", slug).limit(1).execute()
-    if res.data: return res.data[0]["id"]
+    if res.data:
+        _brand_cache[slug] = res.data[0]["id"]
+        return _brand_cache[slug]
     ins = supabase.table("brands").insert({"name": brand_name, "slug": slug}).execute()
-    return ins.data[0]["id"]
+    _brand_cache[slug] = ins.data[0]["id"]
+    return _brand_cache[slug]
 
 def save_ingredients(product_id, raw_inci):
     """Sadece yeni urunler icin cagrilir - tekrar calistirmada duplicate satir olusturmaz."""
@@ -181,8 +194,12 @@ def save_ingredients(product_id, raw_inci):
     items = [clean_text(i) for i in raw_inci.split(",") if clean_text(i)]
     for order, item in enumerate(items, start=1):
         try:
-            res = supabase.table("ingredients").select("id").eq("inci_name", item).limit(1).execute()
-            ing_id = res.data[0]["id"] if res.data else supabase.table("ingredients").insert({"inci_name": item}).execute().data[0]["id"]
+            if item in _ingredient_cache:
+                ing_id = _ingredient_cache[item]
+            else:
+                res = supabase.table("ingredients").select("id").eq("inci_name", item).limit(1).execute()
+                ing_id = res.data[0]["id"] if res.data else supabase.table("ingredients").insert({"inci_name": item}).execute().data[0]["id"]
+                _ingredient_cache[item] = ing_id
             supabase.table("product_ingredients").insert({
                 "product_id": product_id,
                 "ingredient_id": ing_id,
@@ -518,9 +535,26 @@ def process_store(store):
     return stats
 
 def main():
+    import sys
     print("Gece Otomatik Kozmetik Scraper Başlatıldı...")
+
+    # Komut satirindan bir magaza slug'i verilirse (orn: "python scraper.py gratis")
+    # SADECE o magaza islenir. Bu, GitHub Actions'ta 8 magazayi paralel/ayri
+    # islere bolmek icin kullanilir. Argument verilmezse (eskisi gibi) tum
+    # magazalar sirayla islenir - geriye donuk uyumluluk icin.
+    target_slug = sys.argv[1] if len(sys.argv) > 1 else None
+
+    if target_slug:
+        stores_to_run = [s for s in RETAILERS if s["slug"] == target_slug]
+        if not stores_to_run:
+            valid_slugs = ", ".join(s["slug"] for s in RETAILERS)
+            print(f"HATA: '{target_slug}' adinda bir magaza bulunamadi. Gecerli degerler: {valid_slugs}")
+            sys.exit(1)
+    else:
+        stores_to_run = RETAILERS
+
     overall = {}
-    for store in RETAILERS:
+    for store in stores_to_run:
         try:
             overall[store["name"]] = process_store(store)
             time.sleep(3)  # Mağazalar arası 3 saniye dinlenme (Ban koruması)
@@ -531,7 +565,7 @@ def main():
     print("\n==================== GENEL ÖZET ====================")
     for name, s in overall.items():
         print(f"{name}: Yeni={s['new_products']} FiyatGüncel={s['updated_prices']} Atlanan={s['skipped']} Status={s['status_codes']}")
-    print("\nTüm Mağazaların Taranması Tamamlandı!")
+    print("\nTaranma Tamamlandı!")
 
 if __name__ == "__main__":
     main()
