@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        store: [gratis, watsons, sephora, sevil, boyner, rossmann, eveshop, kozmela]
+        store: [gratis, kozmela, boyner, sephora]
     # Her magaza icin ust sinir - buyuk kataloglu bir magaza bile
     # bu sureyi asmamali, guvenlik amacli.
     timeout-minutes: 180
