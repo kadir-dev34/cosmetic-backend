@@ -417,14 +417,24 @@ def parse_shopify_product(product, base_domain):
 
 def parse_product_page(soup, p_res):
     """Genel/esnek urun adi, marka ve fiyat cikarma (magazaya ozel degil, ortak fallback)."""
-    # Urun Adi
+    # Urun Adi - ONCELIK SIRASI ONEMLI: bazi sitelerde (orn. Kozmela) sayfanin
+    # ust menusunde "[class*='title']" ile eslesen bir baslik (orn. "Markalar"
+    # menu basligi) gercek urun basligindan ONCE gelebiliyor. select_one tek
+    # bir cagrida BIRDEN FAZLA secici verilirse belgedeki ILK eslesmeyi
+    # doner - secici sirasina degil, belge sirasina bakar. Bu yuzden en
+    # guvenilir olan "h1" once TEK BASINA denenir, sonra og:title (cok
+    # guvenilir), en son daha riskli class tabanli secicilere dusulur.
     name = None
-    h1 = soup.select_one("h1, .product-name, [class*='product-title'], [class*='title']")
+    h1 = soup.select_one("h1")
     if h1: name = clean_text(h1.get_text())
 
     if not name:
         meta_title = soup.select_one("meta[property='og:title']")
         if meta_title: name = clean_text(meta_title.get("content"))
+
+    if not name:
+        fallback_el = soup.select_one(".product-name, [class*='product-title'], [class*='title']")
+        if fallback_el: name = clean_text(fallback_el.get_text())
 
     if not name: return None, None, None, None, None
 
