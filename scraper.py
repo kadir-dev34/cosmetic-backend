@@ -26,20 +26,20 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 # Her mağaza için "pagination_param": site sayfalamayı hangi query parametresiyle
 # yapıyor (bazıları ?page=N, bazıları ?p=N kullanıyor). "max_pages": kaç sayfaya
 # kadar denenecek üst sınır - boş/tekrar eden sayfa gelirse zaten otomatik durulur.
+#
+# NOT: Watsons, Sevil Parfumeri, Rossmann ve Eve Shop listeden CIKARILDI.
+# Bu 4 magaza hem GitHub'in bulut IP'sinden hem sizin ev IP'nizden (self-hosted
+# runner testi) ayni sekilde 403 (erisim engeli) donduruyordu - hem sitemap.xml
+# hem kategori sayfalari hem (Eve Shop icin) resmi Shopify API'si denendi, hicbiri
+# calismadi. Bu, IP'den bagimsiz, tarayici "parmak izi" tabanli bir bot korumasi
+# oldugunu gosteriyor ve mevcut yontemlerle asilamiyor. Asagidaki 4 magaza ise
+# sorunsuz calisiyor.
 RETAILERS = [
     {
         "name": "Gratis",
         "slug": "gratis",
         "start_urls": ["https://www.gratis.com/makyaj-c-100", "https://www.gratis.com/cilt-bakim-c-200"],
         "pagination_param": "page",
-        "max_pages": 15
-    },
-    {
-        "name": "Watsons",
-        "slug": "watsons",
-        # Duzeltilmis kategori ID'leri (eskisi 1010/1000 hatali idi -> 101/100)
-        "start_urls": ["https://www.watsons.com.tr/cilt-bakim/c/101", "https://www.watsons.com.tr/makyaj/c/100"],
-        "pagination_param": "currentPage",  # Watsons "page" degil "currentPage" kullaniyor
         "max_pages": 15
     },
     {
@@ -51,37 +51,11 @@ RETAILERS = [
         "max_pages": 15
     },
     {
-        "name": "Sevil Parfümeri",
-        "slug": "sevil",
-        # ".html" uzantisi gercek sitede yok
-        "start_urls": ["https://www.sevil.com.tr/parfum", "https://www.sevil.com.tr/cilt-vucut-sac-bakimi", "https://www.sevil.com.tr/makyaj"],
-        "pagination_param": "page",
-        "max_pages": 15
-    },
-    {
         "name": "Boyner Beauty",
         "slug": "boyner",
         "start_urls": ["https://www.boyner.com.tr/kozmetik-c-10", "https://www.boyner.com.tr/parfum-c-1001"],
         "pagination_param": "page",
         "max_pages": 15
-    },
-    {
-        "name": "Rossmann",
-        "slug": "rossmann",
-        # "-c-101" gibi ID'li url'ler gercek sitede yok, kategori duz isimle
-        "start_urls": ["https://www.rossmann.com.tr/makyaj", "https://www.rossmann.com.tr/cilt-bakimi"],
-        "pagination_param": "p",  # Rossmann ?p=N kullaniyor, ?page=N degil
-        "max_pages": 15
-    },
-    {
-        "name": "Eve Shop",
-        "slug": "eveshop",
-        # Eve Shop bir Shopify magazasi - resmi /products.json API'si kullanilir,
-        # HTML kazima gerekmez. "platform": "shopify" bu ozel akisi tetikler.
-        "start_urls": ["https://www.eveshop.com.tr/makyaj", "https://www.eveshop.com.tr/collections/cilt-bakimi"],
-        "pagination_param": "page",
-        "max_pages": 15,
-        "platform": "shopify"
     },
     {
         "name": "Kozmela",
