@@ -66,7 +66,7 @@ RETAILERS = [
     }
 ]
 
-CONCURRENT_WORKERS = 6  # Ayni anda kac urun sayfasi indirilecek (paralel indirme)
+CONCURRENT_WORKERS = 3  # 6 -> 3: Gratis/Sephora'yi engelleyen hiz dusuruldu
 
 def get_scraper():
     s = cloudscraper.create_scraper(
@@ -90,11 +90,9 @@ def get_thread_scraper():
 
 def fetch_product_page(url):
     """Paralel calisan worker'larin cagirdigi fonksiyon: bir urun sayfasini indirir.
-    Kucuk rastgele bir gecikme (jitter) icerir - bu, 6 paralel worker'in bile
-    tamamen bosluksuz/robotik bir istek paterni olusturmasini engeller ve
-    bot korumasi sistemlerinin (Cloudflare, WAF vb.) "burst" trafigi olarak
-    isaretleme riskini azaltir. Hizin buyuk kismi (paralellikten gelen) korunur."""
-    time.sleep(random.uniform(0.3, 0.7))
+    Gecikme suresi artirildi (0.3-0.7 -> 0.8-1.5) - Gratis ve Sephora'nin
+    yuksek hacimde istek sonrasi bizi gecici olarak engellemesini onlemek icin."""
+    time.sleep(random.uniform(0.8, 1.5))
     try:
         scraper = get_thread_scraper()
         res = scraper.get(url, timeout=12)
@@ -123,9 +121,14 @@ def clean_price(val):
     if "," in val:
         val = val.replace(".", "").replace(",", ".")
     try:
-        return float(val)
+        result = float(val)
     except ValueError:
         return None
+    # Sağlamlık kontrolü: kozmetik urunler icin makul olmayan fiyatlar
+    # (orn. 129.930.909 TL gibi yanlislikla yakalanan bir sayi) reddedilir.
+    if result <= 0 or result > 100000:
+        return None
+    return result
 
 def is_valid_ean13(code):
     """EAN-13 checksum dogrulamasi - rastgele 13 haneli sayilari barkod sanmayi engeller."""
@@ -417,6 +420,19 @@ def parse_shopify_product(product, base_domain):
 
 def parse_product_page(soup, p_res):
     """Genel/esnek urun adi, marka ve fiyat cikarma (magazaya ozel degil, ortak fallback)."""
+    # KATEGORI/KOLEKSIYON SAYFASI FILTRESI: cogu e-ticaret platformu (Kozmela'nin
+    # kullandigi T-Soft dahil) gercek urun sayfalarina <meta property="og:type"
+    # content="product"> etiketi koyar. Bu etiket VARSA ama "product" DEGILSE,
+    # bu sayfa bir kategori/koleksiyon/kampanya sayfasidir - urun degildir,
+    # hemen atlanir. URL deseni tahmininden (orn. "urun" kelimesi arama) çok
+    # daha guvenilir bir sinyal, cunku Turkce'de kategori adlari da "urun"
+    # kelimesini icerir (orn. "Burun Aspiratoru", "Kuponlu Urunler").
+    og_type_el = soup.select_one("meta[property='og:type']")
+    if og_type_el:
+        og_type_val = (og_type_el.get("content") or "").strip().lower()
+        if og_type_val and og_type_val != "product":
+            return None, None, None, None, None
+
     # Urun Adi - ONCELIK SIRASI ONEMLI: bazi sitelerde (orn. Kozmela) sayfanin
     # ust menusunde "[class*='title']" ile eslesen bir baslik (orn. "Markalar"
     # menu basligi) gercek urun basligindan ONCE gelebiliyor. select_one tek
