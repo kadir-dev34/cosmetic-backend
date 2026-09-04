@@ -4,6 +4,16 @@ on:
     # Her gece Türkiye saatiyle 03:00 (UTC 00:00)
     - cron: '0 0 * * *'
   workflow_dispatch:
+
+# Aynı mağaza için önceki bir çalıştırma hâlâ sürüyorsa (örn. elle
+# tetikleme ile gecenin cron'u çakışırsa), yeni başlayanı öncekini
+# iptal etmeden kuyruğa almak yerine öncekini iptal ediyoruz; aksi
+# halde iki paralel job aynı mağaza için Supabase'e aynı anda
+# yazabilir.
+concurrency:
+  group: kozmetik-scraper-${{ matrix.store }}
+  cancel-in-progress: true
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -13,9 +23,12 @@ jobs:
       fail-fast: false
       matrix:
         store: [gratis, kozmela, boyner, sephora]
-    # Her magaza icin ust sinir - buyuk kataloglu bir magaza bile
-    # bu sureyi asmamali, guvenlik amacli.
-    timeout-minutes: 180
+    # Her magaza icin ust sinir. scraper.py icindeki MAX_STORE_RUNTIME_SECONDS
+    # (asagida 45 dk olarak ayarli) normalde bu sureden cok once biter;
+    # buradaki 60 dk, sadece kurulum + olasi beklenmeyen takilmalar icin
+    # bir tampon/guvenlik agi. Ikisi birbirinden bagimsiz calismamali -
+    # asagidaki deger degistirilirse buradaki de guncellenmeli.
+    timeout-minutes: 60
     steps:
       - name: Kodu Cek
         uses: actions/checkout@v4
@@ -23,6 +36,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+          cache: 'pip'
       - name: Paketleri Yukle
         run: |
           python -m pip install --upgrade pip
@@ -31,4 +45,8 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SECRET_KEY: ${{ secrets.SUPABASE_SECRET_KEY }}
+          # scraper.py bu sureyi (saniye) asarsa kalan urunleri atlayip
+          # mevcut sonuclarla temiz sekilde biter. timeout-minutes'in
+          # (60 dk = 3600s) altinda kalacak sekilde tampon birakildi.
+          MAX_STORE_RUNTIME_SECONDS: '2700'
         run: python scraper.py ${{ matrix.store }}
