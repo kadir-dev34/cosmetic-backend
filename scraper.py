@@ -3,6 +3,7 @@ import re
 import time
 import random
 import json
+import hashlib
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -62,7 +63,14 @@ RETAILERS = [
 ]
 
 # Sephora ve korumalı siteler için 1 worker (Güvenli Mod)
-CONCURRENT_WORKERS = 1  
+CONCURRENT_WORKERS = 1
+
+# Bir mağazanın taranması bu süreyi (saniye) aşarsa, kalan ürünler atlanıp
+# elde edilen sonuçlarla devam edilir. Bu, bir mağazadaki hata/yavaşlığın
+# (örn. eski Gratis 3 saat sürme sorunu) diğer mağazaların hiç taranamamasına
+# (Sephora'nın "cancelled" olmasına) yol açmasını engeller.
+MAX_STORE_RUNTIME_SECONDS = int(os.getenv("MAX_STORE_RUNTIME_SECONDS", 60 * 40))  # varsayilan 40 dakika
+
 
 def get_scraper():
     s = cloudscraper.create_scraper(
@@ -83,15 +91,18 @@ def get_scraper():
     })
     return s
 
+
 _thread_local = threading.local()
+
 
 def get_thread_scraper():
     if not hasattr(_thread_local, "scraper"):
         _thread_local.scraper = get_scraper()
     return _thread_local.scraper
 
+
 def fetch_product_page(url):
-    # Diğer yapay zekanın önerdiği insansı bekleme süresi (1.0 - 2.5 saniye)
+    # İnsansı bekleme süresi (1.0 - 2.5 saniye)
     time.sleep(random.uniform(1.0, 2.5))
     try:
         scraper = get_thread_scraper()
@@ -100,21 +111,23 @@ def fetch_product_page(url):
     except Exception as e:
         return url, None, str(e)
 
+
 def clean_text(val):
     if not val: return None
     val = str(val).replace("\xa0", " ").replace("\u200b", "").replace("\ufeff", "")
     val = re.sub(r"\s+", " ", val).strip()
     return val if val else None
 
+
 def fix_sephora_title(brand_name, product_name):
     """Sephora'daki bitişik marka+ürün adı sorununu çözer (Örn: GLOW RECIPEWatermelon -> Watermelon)"""
     if not brand_name or not product_name:
         return product_name
     if product_name.startswith(brand_name) and len(product_name) > len(brand_name):
-        # Bitişik yazılmışsa araya boşluk at veya markayı isimden temizle
         cleaned = product_name[len(brand_name):].strip()
         return cleaned if cleaned else product_name
     return product_name
+
 
 def make_slug(text):
     if not text: return None
@@ -124,17 +137,18 @@ def make_slug(text):
     slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
     return slug if slug else f"product-{random.randint(1000, 99999)}"
 
+
 def clean_price(val):
     if not val: return None
     raw = str(val).strip()
     cleaned = re.sub(r"[^\d,.]", "", raw)
     if not cleaned: return None
-    
+
     if "," in cleaned and "." in cleaned:
         cleaned = cleaned.replace(".", "").replace(",", ".")
     elif "," in cleaned:
         cleaned = cleaned.replace(",", ".")
-        
+
     try:
         price_float = float(cleaned)
         if 0 < price_float <= 150000.0:
@@ -142,6 +156,7 @@ def clean_price(val):
         return None
     except ValueError:
         return None
+
 
 def is_valid_ean13(code):
     if not code or len(code) != 13 or not code.isdigit():
@@ -151,14 +166,17 @@ def is_valid_ean13(code):
     check_digit = (10 - (checksum % 10)) % 10
     return check_digit == digits[12]
 
+
 def get_or_create_retailer(name, slug):
     res = supabase.table("retailers").select("id").eq("slug", slug).limit(1).execute()
     if res.data: return res.data[0]["id"]
     ins = supabase.table("retailers").insert({"name": name, "slug": slug}).execute()
     return ins.data[0]["id"]
 
+
 _brand_cache = {}
 _ingredient_cache = {}
+
 
 def get_or_create_brand(brand_name):
     if not brand_name: brand_name = "Genel"
@@ -184,6 +202,7 @@ def get_or_create_brand(brand_name):
             return _brand_cache[slug]
         logging.error(f"Marka ekleme hatasi ({brand_name}): {e}")
         return None
+
 
 def save_ingredients(product_id, raw_inci):
     if not raw_inci: return
@@ -213,6 +232,7 @@ def save_ingredients(product_id, raw_inci):
         except Exception as e:
             logging.error(f"INCI kayit hatasi (Product: {product_id}, Item: {item}): {e}")
 
+
 def save_product_image(product_id, image_url):
     if not image_url: return
     try:
@@ -224,6 +244,7 @@ def save_product_image(product_id, image_url):
         }).execute()
     except Exception as e:
         logging.error(f"Gorsel kayit hatasi (Product: {product_id}): {e}")
+
 
 def save_price(product_id, retailer_id, price, product_url):
     if price is None: return
@@ -239,6 +260,7 @@ def save_price(product_id, retailer_id, price, product_url):
     except Exception as e:
         logging.error(f"Fiyat kayit hatasi (Product: {product_id}): {e}")
 
+
 def parse_sitemap_url(sub_url, product_url_pattern, stats):
     found = set()
     try:
@@ -253,6 +275,7 @@ def parse_sitemap_url(sub_url, product_url_pattern, stats):
     except Exception:
         pass
     return found
+
 
 def try_sitemap_urls(scraper, base_domain, stats):
     candidate_paths = ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/sitemap/sitemap.xml"]
@@ -274,7 +297,7 @@ def try_sitemap_urls(scraper, base_domain, stats):
                     found_urls.add(loc)
 
             relevant_sub = [s for s in sub_sitemaps if re.search(r"product|urun|category|kategori", s, re.IGNORECASE)] or sub_sitemaps[:15]
-            
+
             with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = [executor.submit(parse_sitemap_url, sub_url, product_url_pattern, stats) for sub_url in relevant_sub[:15]]
                 for future in as_completed(futures):
@@ -285,6 +308,25 @@ def try_sitemap_urls(scraper, base_domain, stats):
             continue
 
     return list(found_urls)
+
+
+# ------------------------------------------------------------------
+# BUG FIX #3 & #4 (Boyner/Kozmela): Kategori/listeleme sayfası linkleri
+# ürün linki gibi toplanıyordu ("...-modelleri-boyner", "...urunler-kozmela"
+# gibi URL'ler "urun" alt string'ini içerdiği için ürün sanılıyordu).
+# Bu blocklist, bilinen kategori/listeleme URL kalıplarını dışlar.
+# ------------------------------------------------------------------
+CATEGORY_URL_BLOCKLIST = re.compile(
+    r"(kategori|modelleri|koleksiyon|filtre=|sirala=|/c-\d|-c-\d+(?:/|$))",
+    re.IGNORECASE
+)
+
+
+def _looks_like_product_url(href):
+    if CATEGORY_URL_BLOCKLIST.search(href):
+        return False
+    return any(k in href for k in ["-p-", "/p/", "urun", "product", ".html", "-pr-", "/pr/", "/collections/"])
+
 
 def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param="page", max_pages=15):
     found_urls = set()
@@ -303,15 +345,19 @@ def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param
             soup = BeautifulSoup(res.text, "html.parser")
             for a in soup.find_all("a", href=True):
                 href = a["href"]
-                if any(k in href for k in ["-p-", "/p/", "urun", "product", ".html", "-pr-", "/pr/", "/collections/"]) and not href.startswith("javascript"):
-                    if href.startswith("/"):
-                        base = "/".join(cat_url.split("/")[:3])
-                        href = base + href
-                    found_urls.add(href)
+                if href.startswith("javascript"):
+                    continue
+                if not _looks_like_product_url(href):
+                    continue
+                if href.startswith("/"):
+                    base = "/".join(cat_url.split("/")[:3])
+                    href = base + href
+                found_urls.add(href)
 
             script_urls = re.findall(r'https?://[^\s"\'<>]+(?:-p-|-pr-|/p/|/pr/|urun)[^\s"\'<>]*', res.text)
             for u in script_urls:
-                found_urls.add(u)
+                if _looks_like_product_url(u):
+                    found_urls.add(u)
 
             new_count = len(found_urls) - before_count
             if new_count == 0:
@@ -320,15 +366,119 @@ def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param
             else:
                 consecutive_empty = 0
 
-            # Kategori sayfaları arası güvenli bekleme (0.8 saniye)
             time.sleep(0.8)
         except Exception:
             break
 
     return list(found_urls)
 
+
+# ------------------------------------------------------------------
+# BUG FIX #2 (Kozmela "799 TL" sorunu): [class*='price'] gibi geniş
+# CSS seçiciler, "799 TL üzeri ücretsiz kargo" gibi kargo/taksit
+# banner'larını "fiyat" sanıp yakalıyordu. Bu fonksiyon, eşleşen
+# elementin (ve yakın ebeveyninin) metninde kargo/taksit gibi
+# yanıltıcı kelimeler varsa o elementi reddeder.
+# ------------------------------------------------------------------
+PRICE_BLACKLIST_WORDS = ["kargo", "ücretsiz", "taksit", "üzeri", "kupon", "indirim kodu"]
+
+
+def _is_valid_price_context(el):
+    context = (el.get_text(" ", strip=True) or "").lower()
+    parent = el.parent
+    if parent is not None:
+        context += " " + (parent.get_text(" ", strip=True) or "").lower()[:200]
+    return not any(bad in context for bad in PRICE_BLACKLIST_WORDS)
+
+
+# ------------------------------------------------------------------
+# BUG FIX #1 (Gratis içerik/ingredient sorunu): Eski kod, "İçindekiler"
+# veya "Ingredients" kelimesini içeren İLK elementi (find_all sırası
+# gereği genelde en dıştaki büyük wrapper div) kabul edip metnini
+# olduğu gibi INCI listesi olarak kaydediyordu. Bu da yorumları, iade
+# politikasını, firma adresini vs. "ingredient" olarak DB'ye yazıyordu
+# ve binlerce gereksiz satır/istek yüzünden scraper'ı ciddi yavaşlatıyordu.
+#
+# Yeni yaklaşım:
+#  - Eşleşen tüm adaylar toplanır, en KISA (en spesifik) aday seçilir.
+#  - Kara liste kelimeleri (iade, yorum, kargo, sipariş vb.) içeren
+#    adaylar elenir.
+#  - Bir INCI listesinin virgülle ayrılmış parçaları kısa olmalıdır;
+#    ortalama parça uzunluğu ve kelime sayısı bir "paragraf" gibi
+#    görünüyorsa aday reddedilir.
+# ------------------------------------------------------------------
+INGREDIENT_BLACKLIST_WORDS = [
+    "iade", "kolay i̇ade", "değerlendirme", "yorum", "kargo", "taksit",
+    "hesabım", "sipariş", "ürün kodu", "ürün barkodu", "menşei",
+    "anahtar kelimeler", "favoriledi", "satın al", "sepete ekle",
+    "vergi", "banka kartı", "kredi kartı", "ticari ünvan", "posta adresi",
+    "e-posta", "ithalatçı", "üretici firma", "değerlendir"
+]
+
+
+def _looks_like_ingredient_list(txt):
+    if not txt or len(txt) < 10 or len(txt) > 1200:
+        return False
+    lower = txt.lower()
+    if any(bad in lower for bad in INGREDIENT_BLACKLIST_WORDS):
+        return False
+    parts = [p.strip() for p in txt.split(",") if p.strip()]
+    if len(parts) < 2:
+        return False
+    avg_len = sum(len(p) for p in parts) / len(parts)
+    if avg_len > 45:
+        return False
+    if any(len(p.split()) > 8 for p in parts):
+        return False
+    return True
+
+
+def extract_ingredients(soup):
+    candidates = []
+    for el in soup.find_all(["div", "p", "span", "li", "section"]):
+        txt = clean_text(el.get_text())
+        if not txt:
+            continue
+        if "İçindekiler" not in txt and "Ingredients" not in txt and "INCI" not in txt.upper():
+            continue
+        candidate = txt.replace("İçindekiler:", "").replace("Ingredients:", "").replace("İçindekiler", "").strip()
+        candidate = clean_text(candidate)
+        if _looks_like_ingredient_list(candidate):
+            candidates.append(candidate)
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=len)
+    return candidates[0]
+
+
+# ------------------------------------------------------------------
+# BUG FIX #3 (Boyner/Kozmela "kategori sayfası = ürün" sorunu):
+# KNOWN_NON_PRODUCT_NAMES yalnızca tam eşleşen birkaç sabit isme
+# bakıyordu ("Bakım Ürünleri Modelleri" gibi türetilmiş isimler
+# kaçıyordu). Şimdi "Modelleri/Ürünleri/Ürünler" gibi tipik
+# kategori-sayfası son ekleri regex ile de yakalanıyor. Ayrıca
+# JSON-LD'de "Product" şeması bulunamadıysa (yani isim H1/og:title
+# fallback'inden geldiyse), sayfada gerçek bir "Sepete Ekle" butonu
+# olup olmadığı da kontrol ediliyor.
+# ------------------------------------------------------------------
+KNOWN_NON_PRODUCT_NAMES = {
+    "süpermarket", "markalar", "makyaj", "cilt bakım", "saç bakım",
+    "temizleme ürünleri", "kağıt ürünleri", "tekstil ürünleri",
+    "güneş ürünleri", "bebek banyo ürünleri", "kadın", "erkek", "bebek",
+    "kozmetik", "kız çocuk", "erkek çocuk", "parfüm", "aksesuar"
+}
+
+CATEGORY_NAME_SUFFIX_PATTERN = re.compile(
+    r"(modelleri|model[iİ]|ürünleri|ürünler|urunleri|urunler)\s*$",
+    re.IGNORECASE
+)
+
+
 def parse_product_page(soup, p_res):
     name, brand_name, price, image_url, inci_text = None, "Genel", None, None, None
+    is_confirmed_product = False  # JSON-LD'de @type=Product bulunduysa True
 
     # 1. JSON-LD Parsing
     try:
@@ -339,17 +489,18 @@ def parse_product_page(soup, p_res):
             items = data if isinstance(data, list) else [data]
             for item in items:
                 if item.get("@type") == "Product":
+                    is_confirmed_product = True
                     name = clean_text(item.get("name"))
                     if "brand" in item:
                         brand_info = item["brand"]
                         brand_name = brand_info.get("name") if isinstance(brand_info, dict) else str(brand_info)
-                    
+
                     offers = item.get("offers", {})
                     if isinstance(offers, list) and offers: offers = offers[0]
-                    
+
                     raw_p = offers.get("price") or offers.get("lowPrice")
                     if raw_p: price = clean_price(raw_p)
-                    
+
                     image = item.get("image")
                     if isinstance(image, list) and image: image_url = image[0]
                     elif isinstance(image, str): image_url = image
@@ -369,15 +520,22 @@ def parse_product_page(soup, p_res):
 
     if not name: return None, None, None, None, None
 
-    KNOWN_NON_PRODUCT_NAMES = {
-        "süpermarket", "markalar", "makyaj", "cilt bakım", "saç bakım",
-        "temizleme ürünleri", "kağıt ürünleri", "tekstil ürünleri",
-        "güneş ürünleri", "bebek banyo ürünleri", "kadın", "erkek", "bebek",
-        "kozmetik", "kız çocuk", "erkek çocuk", "parfüm", "aksesuar"
-    }
     name_normalized = name.strip().lower().rstrip(".")
-    if name_normalized in KNOWN_NON_PRODUCT_NAMES or len(name_normalized.split()) <= 1:
+    word_count = len(name_normalized.split())
+    if (
+        name_normalized in KNOWN_NON_PRODUCT_NAMES
+        or word_count <= 1
+        or CATEGORY_NAME_SUFFIX_PATTERN.search(name_normalized)
+    ):
         return None, None, None, None, None
+
+    # JSON-LD ile doğrulanmadıysa, gerçek bir ürün sayfası olduğunu
+    # "Sepete Ekle" benzeri bir eleman varlığıyla teyit et.
+    if not is_confirmed_product:
+        has_cart_text = soup.find(string=re.compile(r"sepete ekle|add to cart|satın al", re.IGNORECASE))
+        has_cart_button = soup.select_one("button[class*='cart'], button[class*='sepet'], [class*='add-to-cart']")
+        if not has_cart_text and not has_cart_button:
+            return None, None, None, None, None
 
     if not brand_name or brand_name == "Genel":
         brand_el = soup.select_one("[class*='brand'], [itemprop='brand'], .product-brand")
@@ -396,12 +554,15 @@ def parse_product_page(soup, p_res):
             "[class*='discounted']", "[itemprop='price']", "span[data-price]", "[class*='price']"
         ]
         for sel in priority_selectors:
-            el = soup.select_one(sel)
-            if el:
+            for el in soup.select(sel):
+                if not _is_valid_price_context(el):
+                    continue
                 p = clean_price(el.get_text())
                 if p:
                     price = p
                     break
+            if price:
+                break
 
     if not image_url:
         img_el = soup.select_one("meta[property='og:image'], [class*='product-image'] img")
@@ -410,20 +571,18 @@ def parse_product_page(soup, p_res):
             if candidate and "logo" not in candidate.lower():
                 image_url = candidate
 
-    for el in soup.find_all(["div", "p", "span", "section"]):
-        txt = el.get_text()
-        if ("İçindekiler" in txt or "Ingredients" in txt) and len(txt) > 30 and "," in txt:
-            inci_text = clean_text(txt.replace("İçindekiler:", "").replace("Ingredients:", ""))
-            break
+    if not inci_text:
+        inci_text = extract_ingredients(soup)
 
     return name, brand_name, price, image_url, inci_text
+
 
 def process_store(store):
     print(f"\n==================== {store['name']} Taranıyor ====================")
     scraper = get_scraper()
     retailer_id = get_or_create_retailer(store["name"], store["slug"])
 
-    stats = {"status_codes": {}, "new_products": 0, "updated_prices": 0, "skipped": 0}
+    stats = {"status_codes": {}, "new_products": 0, "updated_prices": 0, "skipped": 0, "timed_out": False}
 
     pagination_param = store.get("pagination_param", "page")
     max_pages = store.get("max_pages", 15)
@@ -441,10 +600,28 @@ def process_store(store):
     print(f"[{store['name']}] Bulunan Urun Linki Sayisi: {len(product_urls)}")
 
     idx = 0
+    start_time = time.time()
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
         future_to_url = {executor.submit(fetch_product_page, url): url for url in product_urls}
 
         for future in as_completed(future_to_url):
+            # BUG FIX #5 (Sephora hiç taranamadan iptal olması): Bir mağaza
+            # çok uzun sürerse (eskiden Gratis ~3 saat sürüp job'ı tükettiği
+            # için Sephora hiç başlayamadan cancel oldu), zaman sınırına
+            # ulaşınca kalan ürünler atlanıp mevcut sonuçlarla devam edilir.
+            # Not: Bu script-seviyesinde bir güvenlik önlemidir; asıl önerilen
+            # çözüm, GitHub Actions workflow'unda mağazaları paralel matrix
+            # job olarak, her birine ayrı timeout-minutes vererek çalıştırmaktır.
+            if time.time() - start_time > MAX_STORE_RUNTIME_SECONDS:
+                logging.warning(
+                    f"[{store['name']}] Zaman siniri ({MAX_STORE_RUNTIME_SECONDS}s) asildi. "
+                    f"Kalan urunler atlanip mevcut sonuclarla devam ediliyor."
+                )
+                stats["timed_out"] = True
+                for f in future_to_url:
+                    f.cancel()
+                break
+
             url, p_res, error = future.result()
             idx += 1
             try:
@@ -480,7 +657,18 @@ def process_store(store):
 
                 slug = make_slug(name)
                 unique_slug = f"{slug}-{store['slug']}"
-                existing = supabase.table("products").select("id").eq("slug", unique_slug).limit(1).execute()
+                existing = supabase.table("products").select("id, name").eq("slug", unique_slug).limit(1).execute()
+
+                # BUG FIX #4 (slug çakışması): Aynı slug'a sahip ama adı
+                # tamamen farklı bir ürün varsa (yanlışlıkla iki farklı
+                # sayfa aynı slug'ı üretmiş olabilir), üzerine yazmak yerine
+                # URL'e dayalı benzersiz bir slug ile yeni kayıt oluştur.
+                if existing.data:
+                    existing_name = (existing.data[0].get("name") or "").strip().lower()
+                    if existing_name and existing_name != name.strip().lower():
+                        url_hash = hashlib.md5(url.encode()).hexdigest()[:6]
+                        unique_slug = f"{slug}-{url_hash}-{store['slug']}"
+                        existing = supabase.table("products").select("id, name").eq("slug", unique_slug).limit(1).execute()
 
                 is_new_product = not existing.data
 
@@ -514,8 +702,9 @@ def process_store(store):
                 stats["skipped"] += 1
                 continue
 
-    print(f"[{store['name']}] ÖZET -> Yeni: {stats['new_products']} | Fiyat güncellenen: {stats['updated_prices']} | Atlanan: {stats['skipped']} | Status kodları: {stats['status_codes']}")
+    print(f"[{store['name']}] ÖZET -> Yeni: {stats['new_products']} | Fiyat güncellenen: {stats['updated_prices']} | Atlanan: {stats['skipped']} | Zaman Asimi: {stats['timed_out']} | Status kodları: {stats['status_codes']}")
     return stats
+
 
 def main():
     import sys
@@ -543,8 +732,9 @@ def main():
 
     print("\n==================== GENEL ÖZET ====================")
     for name, s in overall.items():
-        print(f"{name}: Yeni={s['new_products']} FiyatGüncel={s['updated_prices']} Atlanan={s['skipped']} Status={s['status_codes']}")
+        print(f"{name}: Yeni={s['new_products']} FiyatGüncel={s['updated_prices']} Atlanan={s['skipped']} ZamanAsimi={s.get('timed_out')} Status={s['status_codes']}")
     print("\nTaranma Tamamlandı!")
+
 
 if __name__ == "__main__":
     main()
