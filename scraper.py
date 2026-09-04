@@ -61,8 +61,8 @@ RETAILERS = [
     }
 ]
 
-# Ban yememek ve WAF/Cloudflare engellerini aşmak için ideal iş parçacığı
-CONCURRENT_WORKERS = 2  
+# Sephora'nın hassas koruması nedeniyle 1 worker kullanıyoruz
+CONCURRENT_WORKERS = 1  
 
 def get_scraper():
     s = cloudscraper.create_scraper(
@@ -129,8 +129,8 @@ def clean_price(val):
         
     try:
         price_float = float(cleaned)
-        # Mantıksız veya anlamsız fiyatları filtreleme
-        if 5.0 <= price_float <= 150000.0:
+        # Sadece çok uçuk (150.000 TL üstü) fiyatları engelle, alt sınır YOK
+        if price_float <= 150000.0:
             return price_float
         return None
     except ValueError:
@@ -373,12 +373,7 @@ def parse_shopify_product(product, base_domain):
     return name, brand_name, price, image_url, product_url, barcode, inci_text
 
 def parse_product_page(soup, p_res):
-    # ESNEK KATEGORİ FİLTRESİ (Sadece net olarak kategori/website olanları atlar)
-    og_type_el = soup.select_one("meta[property='og:type']")
-    if og_type_el:
-        og_type_val = (og_type_el.get("content") or "").strip().lower()
-        if og_type_val in ["website", "article", "category"]:
-            return None, None, None, None, None
+    # og:type kontrolü tamamen kaldırıldı – artık sadece isim ve fiyat varlığına göre karar verilecek
 
     name, brand_name, price, image_url, inci_text = None, "Genel", None, None, None
 
