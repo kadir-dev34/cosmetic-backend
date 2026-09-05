@@ -37,32 +37,43 @@ RETAILERS = [
         "slug": "gratis",
         "start_urls": ["https://www.gratis.com/makyaj-c-100", "https://www.gratis.com/cilt-bakim-c-200"],
         "pagination_param": "page",
-        "max_pages": 15
+        "max_pages": 15,
+        # BUG FIX #6 (Gratis kapsam sorunu): 13.996 link icin worker=1 + 1-2.5s
+        # bekleme ile 45 dk'da sadece ~1.300 urun islenebiliyordu (Zaman Asimi:
+        # True, katalogun ~%90'i hic taranmadan atlaniyordu). Gratis, Sephora
+        # gibi agresif bot korumasi olan bir site DEGIL (cloudscraper sorunsuz
+        # calisiyor), bu yuzden burada worker sayisini guvenle artirabiliriz.
+        "concurrent_workers": 4
     },
     {
         "name": "Sephora",
         "slug": "sephora",
         "start_urls": ["https://www.sephora.com.tr/makyaj-c302/", "https://www.sephora.com.tr/cilt-bakim-c303/"],
         "pagination_param": "page",
-        "max_pages": 15
+        "max_pages": 15,
+        # Sephora korumali bir site (tum urun sayfalarinda 403 aliniyor) -
+        # worker sayisini artirmak sorunu cozmez, sadece 403 sayisini artirir.
+        "concurrent_workers": 1
     },
     {
         "name": "Boyner Beauty",
         "slug": "boyner",
         "start_urls": ["https://www.boyner.com.tr/kozmetik-c-10", "https://www.boyner.com.tr/parfum-c-1001"],
         "pagination_param": "page",
-        "max_pages": 15
+        "max_pages": 15,
+        "concurrent_workers": 2
     },
     {
         "name": "Kozmela",
         "slug": "kozmela",
         "start_urls": ["https://www.kozmela.com/cilt-bakimi", "https://www.kozmela.com/makyaj"],
         "pagination_param": "page",
-        "max_pages": 15
+        "max_pages": 15,
+        "concurrent_workers": 2
     }
 ]
 
-# Sephora ve korumalı siteler için 1 worker (Güvenli Mod)
+# Varsayilan worker sayisi (store bazinda "concurrent_workers" verilmezse kullanilir)
 CONCURRENT_WORKERS = 1
 
 # Bir mağazanın taranması bu süreyi (saniye) aşarsa, kalan ürünler atlanıp
@@ -80,12 +91,14 @@ def get_scraper():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
         "Sec-Ch-Ua": '"Google Chrome";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
         "Sec-Ch-Ua-Mobile": "?0",
         "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "document",
         "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Site": "same-origin",
         "Sec-Fetch-User": "?1",
         "Upgrade-Insecure-Requests": "1"
     })
@@ -95,18 +108,38 @@ def get_scraper():
 _thread_local = threading.local()
 
 
-def get_thread_scraper():
-    if not hasattr(_thread_local, "scraper"):
+def get_thread_scraper(fresh=False):
+    if fresh or not hasattr(_thread_local, "scraper"):
         _thread_local.scraper = get_scraper()
     return _thread_local.scraper
 
 
-def fetch_product_page(url):
-    # İnsansı bekleme süresi (1.0 - 2.5 saniye)
-    time.sleep(random.uniform(1.0, 2.5))
+# ------------------------------------------------------------------
+# BUG (Sephora 403): Tum urun sayfalarina yapilan istekler 403 donuyordu
+# (sitemap istekleri 200 donuyor, yani engel sadece urun sayfalarinda).
+# Bunun kesin nedeni bu ortamdan (network erisimi kapali) dogrulanamaz,
+# ama en olasi ihtimaller: (a) Referer header'i olmadan dogrudan sitemap'ten
+# gelen URL'lere "atlanmis" gibi gorunmek, (b) ayni oturumun cok sayida
+# istek sonrasi isaretlenmesi. Asagidaki degisiklikler ikisini de hedefler:
+# base URL'i Referer olarak eklemek + 403 alinca oturumu tazeleyip (yeni
+# TLS/cookie fingerprint ile) bir kez daha, daha uzun bir bekleme ile
+# denemek. Bu, guclu bot korumalarini (Akamai/PerimeterX/Datadome tarzi)
+# kesin cozmez -- cozmezse gercek ihtiyac headless bir tarayicidir
+# (orn. Playwright) ve bunu ayrica not ediyoruz.
+# ------------------------------------------------------------------
+def fetch_product_page(url, referer=None, min_delay=1.0, max_delay=2.5):
+    time.sleep(random.uniform(min_delay, max_delay))
     try:
         scraper = get_thread_scraper()
-        res = scraper.get(url, timeout=15)
+        headers = {"Referer": referer} if referer else {}
+        res = scraper.get(url, timeout=15, headers=headers)
+
+        if res.status_code == 403:
+            # Bir kez, daha uzun bekleme + taze oturumla tekrar dene
+            time.sleep(random.uniform(4.0, 8.0))
+            scraper = get_thread_scraper(fresh=True)
+            res = scraper.get(url, timeout=15, headers=headers)
+
         return url, res, None
     except Exception as e:
         return url, None, str(e)
@@ -380,7 +413,11 @@ def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param
 # elementin (ve yakın ebeveyninin) metninde kargo/taksit gibi
 # yanıltıcı kelimeler varsa o elementi reddeder.
 # ------------------------------------------------------------------
-PRICE_BLACKLIST_WORDS = ["kargo", "ücretsiz", "taksit", "üzeri", "kupon", "indirim kodu"]
+PRICE_BLACKLIST_WORDS = [
+    "kargo", "ücretsiz", "taksit", "üzeri", "kupon", "indirim kodu",
+    "hediye çeki", "hediye kartı", "bakiye", "puan kazan", "başlayan fiyat",
+    "kazandır", "kampanya"
+]
 
 
 def _is_valid_price_context(el):
@@ -389,6 +426,38 @@ def _is_valid_price_context(el):
     if parent is not None:
         context += " " + (parent.get_text(" ", strip=True) or "").lower()[:200]
     return not any(bad in context for bad in PRICE_BLACKLIST_WORDS)
+
+
+# ------------------------------------------------------------------
+# BUG FIX #2b (Kozmela "799 TL" hatasi devam ediyordu): Onceki
+# _is_valid_price_context() blacklist'i sadece bilinen kargo/taksit
+# banner'larini yakaliyordu. Ama loglar gosterdi ki (run #41) 220
+# urunun ~153'u yine BIREBIR AYNI fiyatla (799.0 TL) kaydedildi --
+# tirnak makasi, sampuan, fondoten, biberon gibi tamamen farkli
+# urunler. Bu, sitede her sayfada ayni sekilde goruntulenen (ama
+# blacklist kelimelerini icermeyen) baska bir sabit widget'in genis
+# "[class*='price']" secicisiyle yakalanmasindan kaynaklaniyor olmali.
+#
+# Blacklist kelime tahmin etmek yerine, DAVRANISSAL bir anomali
+# kontrolu ekliyoruz: ayni fiyat degeri, en genis/en son care secici
+# ("[class*='price']") uzerinden ayni store calistirmasi icinde N'den
+# fazla kez tekrar ederse, bu deger artik guvenilmez sayilir ve o
+# urun icin fiyat bulunamadi kabul edilir (urun atlanir, DB'ye yanlis
+# fiyat yazilmaz). Gercek urunlerde ayni fiyatin birkac kez tekrar
+# etmesi normaldir (ayni fiyatli farkli renkler vb.) - esik bu yuzden
+# yuksek tutuldu (10), asil amac 153/220 gibi kitlesel tekrari yakalamak.
+# ------------------------------------------------------------------
+BROAD_PRICE_REPEAT_THRESHOLD = 10
+_broad_price_counts_lock = threading.Lock()
+
+
+def _register_broad_price_and_check(price_counts, price):
+    """price_counts: process_store'dan gelen, store'a ozel paylasimli dict.
+    True donerse fiyat guvenilir (kullanilabilir), False donerse suspicious."""
+    with _broad_price_counts_lock:
+        count = price_counts.get(price, 0) + 1
+        price_counts[price] = count
+        return count <= BROAD_PRICE_REPEAT_THRESHOLD
 
 
 # ------------------------------------------------------------------
@@ -476,7 +545,7 @@ CATEGORY_NAME_SUFFIX_PATTERN = re.compile(
 )
 
 
-def parse_product_page(soup, p_res):
+def parse_product_page(soup, p_res, price_counts=None):
     name, brand_name, price, image_url, inci_text = None, "Genel", None, None, None
     is_confirmed_product = False  # JSON-LD'de @type=Product bulunduysa True
 
@@ -529,12 +598,30 @@ def parse_product_page(soup, p_res):
     ):
         return None, None, None, None, None
 
-    # JSON-LD ile doğrulanmadıysa, gerçek bir ürün sayfası olduğunu
-    # "Sepete Ekle" benzeri bir eleman varlığıyla teyit et.
+    # ------------------------------------------------------------------
+    # BUG FIX #3b (Boyner asiri filtreleme): JSON-LD ile dogrulanmayan
+    # sayfalarda "gercek urun mu" testi olarak SADECE "Sepete Ekle"
+    # buton/metni araniyordu, bulunamazsa sayfa TAMAMEN reddediliyordu.
+    # Run #41'de Boyner'da 528 linkten 527'si bu yuzden atlandi -- Boyner'in
+    # gercek HTML yapisi bu iki secicinin hicbirine uymuyor (buton JS ile
+    # sonradan render ediliyor olabilir, farkli bir class ismi kullaniyor
+    # olabilir vb.). Bu kontrolu SERTCE reddetmek yerine bir "guven puani"
+    # sinyaline indirgiyoruz: cart isareti yoksa direkt eleriz ama SADECE
+    # asagidaki fiyat kontrolunde de gecerli bir fiyat bulunamazsa (zaten
+    # process_store'da "price is None -> atla" kontrolu var). Boylece
+    # kategori sayfalari (fiyatsiz) yine elenir, ama fiyati olan gercek
+    # urunler artik sirf "sepete ekle" metni bulunamadi diye kaybedilmez.
+    # ------------------------------------------------------------------
+    has_weak_cart_signal = True
     if not is_confirmed_product:
         has_cart_text = soup.find(string=re.compile(r"sepete ekle|add to cart|satın al", re.IGNORECASE))
         has_cart_button = soup.select_one("button[class*='cart'], button[class*='sepet'], [class*='add-to-cart']")
-        if not has_cart_text and not has_cart_button:
+        has_weak_cart_signal = bool(has_cart_text or has_cart_button)
+        # Ne cart isareti ne de JSON-LD var VE isim de zayifsa (tek/iki
+        # kelime, buyuk ihtimalle bir menu/breadcrumb basligi), o zaman
+        # dogrudan ele -- bu hala eski "kategori sayfasi" hatasina karsi
+        # bir güvenlik agi, ama artik tek basina yeterli bir red sebebi degil.
+        if not has_weak_cart_signal and word_count <= 3:
             return None, None, None, None, None
 
     if not brand_name or brand_name == "Genel":
@@ -549,18 +636,29 @@ def parse_product_page(soup, p_res):
     name = fix_sephora_title(brand_name, name)
 
     if not price:
+        # "[class*='price']" en genis/son care secici -- bir onceki Kozmela
+        # "799 TL" hatasinin kaynagi buydu. Buna ozel anomali kontrolu uygulanir.
+        broad_selector = "[class*='price']"
         priority_selectors = [
             ".price-sales", ".price-undiscounted", ".discount-price", ".current-price",
-            "[class*='discounted']", "[itemprop='price']", "span[data-price]", "[class*='price']"
+            "[class*='discounted']", "[itemprop='price']", "span[data-price]", broad_selector
         ]
         for sel in priority_selectors:
             for el in soup.select(sel):
                 if not _is_valid_price_context(el):
                     continue
                 p = clean_price(el.get_text())
-                if p:
-                    price = p
-                    break
+                if not p:
+                    continue
+                if sel == broad_selector and price_counts is not None:
+                    if not _register_broad_price_and_check(price_counts, p):
+                        # Bu fiyat, ayni calistirmada esik degerinden fazla
+                        # tekrar etti -> muhtemelen sabit bir widget/banner,
+                        # gercek urun fiyati degil. Bu adayi reddet, sonraki
+                        # elemana/seciciye gec.
+                        continue
+                price = p
+                break
             if price:
                 break
 
@@ -601,8 +699,12 @@ def process_store(store):
 
     idx = 0
     start_time = time.time()
-    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as executor:
-        future_to_url = {executor.submit(fetch_product_page, url): url for url in product_urls}
+    price_counts = {}  # BUG FIX #2b: Kozmela "799 TL" anomali kontrolu icin store'a ozel sayac
+    workers = store.get("concurrent_workers", CONCURRENT_WORKERS)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_url = {
+            executor.submit(fetch_product_page, url, referer=base_domain): url for url in product_urls
+        }
 
         for future in as_completed(future_to_url):
             # BUG FIX #5 (Sephora hiç taranamadan iptal olması): Bir mağaza
@@ -635,7 +737,7 @@ def process_store(store):
                     continue
                 soup = BeautifulSoup(p_res.text, "html.parser")
 
-                name, brand_name, price, image_url, inci_text = parse_product_page(soup, p_res)
+                name, brand_name, price, image_url, inci_text = parse_product_page(soup, p_res, price_counts)
                 if not name or price is None:
                     stats["skipped"] += 1
                     continue
