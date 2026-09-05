@@ -19,6 +19,30 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 # ============================================================
+# TEŞHİS (DEBUG) MODU
+# ------------------------------------------------------------
+# Boyner (528 -> 3 ürün) ve Kozmela (220 -> 0 ürün) linklerinin
+# aniden kaybolması, filtreleme mantığında görünür bir hata OLMADAN
+# gerçekleşti. Bu, ya (a) sitelerin sitemap/kategori sayfası
+# içeriğinin gerçekten değiştiğini, ya da (b) bu ortamdan
+# göremediğimiz bir yan etkiyi işaret ediyor. Kör bir "düzeltme"
+# denemek yerine (ki son 3 turda tam olarak bunun yeni regresyonlara
+# yol açtığını gördük), aşağıdaki DEBUG çıktıları bir sonraki
+# çalıştırmada ham veriyi (kaç <loc>/<a href> bulundu, örnek URL'ler,
+# 404/403 sayfasının gerçek içeriği) doğrudan log'a yazar. Bu sayede
+# kör tahmin yerine kanıta dayalı düzeltme yapılabilir.
+# İşiniz bitince DEBUG_DIAGNOSTICS = False yaparak log hacmini
+# eski haline getirebilirsiniz.
+# ============================================================
+DEBUG_DIAGNOSTICS = True
+
+
+def _dbg(msg):
+    if DEBUG_DIAGNOSTICS:
+        print(f"    [DEBUG] {msg}")
+
+
+# ============================================================
 # 1. BAGLANTI VE AYARLAR
 # ============================================================
 load_dotenv()
@@ -300,13 +324,26 @@ def parse_sitemap_url(sub_url, product_url_pattern, stats):
         scraper = get_thread_scraper()
         sub_res = scraper.get(sub_url, timeout=12)
         stats["status_codes"][f"sitemap:{sub_res.status_code}"] = stats["status_codes"].get(f"sitemap:{sub_res.status_code}", 0) + 1
+
+        # --- DEBUG: alt-sitemap gercekten ne donduruyor? ---
+        _dbg(f"[sitemap-sub] {sub_url} -> {sub_res.status_code}, "
+             f"Content-Type={sub_res.headers.get('Content-Type')}, boyut={len(sub_res.text)}b")
+
         if sub_res.status_code == 200:
             sub_locs = re.findall(r"<loc>([^<]+)</loc>", sub_res.text)
-            for loc in sub_locs:
-                if product_url_pattern.search(loc):
-                    found.add(loc)
-    except Exception:
-        pass
+            matched = [loc for loc in sub_locs if product_url_pattern.search(loc)]
+            found.update(matched)
+            # --- DEBUG: pattern kac tanesini eslestirdi, eslesmeyenler nasil gorunuyor? ---
+            _dbg(f"[sitemap-sub] {sub_url}: toplam <loc>={len(sub_locs)}, pattern-eslesen={len(matched)}")
+            if sub_locs and not matched:
+                _dbg(f"[sitemap-sub] HIC ESLESME YOK, ornek loc'lar: {sub_locs[:5]}")
+            elif sub_locs and len(matched) < len(sub_locs) * 0.1:
+                _dbg(f"[sitemap-sub] COK DUSUK eslesme orani, ornek eslesmeyen loc: "
+                     f"{[l for l in sub_locs if l not in matched][:5]}")
+        elif sub_res.status_code != 200:
+            _dbg(f"[sitemap-sub] basarisiz yanit govdesi (ilk 200 karakter): {sub_res.text[:200]!r}")
+    except Exception as e:
+        _dbg(f"[sitemap-sub] HATA {sub_url}: {e}")
     return found
 
 
@@ -319,17 +356,33 @@ def try_sitemap_urls(scraper, base_domain, stats):
         try:
             res = scraper.get(base_domain + path, timeout=12)
             stats["status_codes"][f"sitemap:{res.status_code}"] = stats["status_codes"].get(f"sitemap:{res.status_code}", 0) + 1
+
+            # --- DEBUG: bu istek gercekte ne donduruyor (durum + govde onizleme)? ---
+            _dbg(f"[sitemap] {base_domain + path} -> {res.status_code}, "
+                 f"Content-Type={res.headers.get('Content-Type')}, boyut={len(res.text)}b")
+            if res.status_code != 200:
+                _dbg(f"[sitemap] basarisiz yanit govdesi (ilk 200 karakter): {res.text[:200]!r}")
+
             if res.status_code != 200 or "xml" not in res.headers.get("Content-Type", "").lower():
                 continue
 
             sub_sitemaps = re.findall(r"<loc>([^<]+\.xml[^<]*)</loc>", res.text)
             locs = re.findall(r"<loc>([^<]+)</loc>", res.text)
 
+            # --- DEBUG: index sitemap'inde kac <loc> var, kac tanesi urun sayilip yakalandi? ---
+            _dbg(f"[sitemap] {path}: toplam <loc>={len(locs)}, alt-sitemap sayisi={len(sub_sitemaps)}")
+            if locs[:5]:
+                _dbg(f"[sitemap] ornek loc'lar: {locs[:5]}")
+
+            matched_top = 0
             for loc in locs:
                 if loc not in sub_sitemaps and product_url_pattern.search(loc):
                     found_urls.add(loc)
+                    matched_top += 1
+            _dbg(f"[sitemap] {path}: ust seviyede pattern-eslesen={matched_top}")
 
             relevant_sub = [s for s in sub_sitemaps if re.search(r"product|urun|category|kategori", s, re.IGNORECASE)] or sub_sitemaps[:15]
+            _dbg(f"[sitemap] islenecek alt-sitemap sayisi={len(relevant_sub[:15])}, ornekler: {relevant_sub[:5]}")
 
             with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = [executor.submit(parse_sitemap_url, sub_url, product_url_pattern, stats) for sub_url in relevant_sub[:15]]
@@ -337,9 +390,11 @@ def try_sitemap_urls(scraper, base_domain, stats):
                     found_urls.update(future.result())
 
             if found_urls: break
-        except Exception:
+        except Exception as e:
+            _dbg(f"[sitemap] HATA {path}: {e}")
             continue
 
+    _dbg(f"[sitemap] TOPLAM bulunan urun linki={len(found_urls)}")
     return list(found_urls)
 
 
@@ -372,16 +427,29 @@ def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param
             res = scraper.get(page_url, timeout=12)
             stats["status_codes"][res.status_code] = stats["status_codes"].get(res.status_code, 0) + 1
 
-            if res.status_code != 200: break
+            # --- DEBUG: kategori sayfasi gercekte ne donduruyor? ---
+            _dbg(f"[category] {page_url} -> {res.status_code}, boyut={len(res.text)}b")
+
+            if res.status_code != 200:
+                _dbg(f"[category] basarisiz yanit govdesi (ilk 200 karakter): {res.text[:200]!r}")
+                break
 
             before_count = len(found_urls)
             soup = BeautifulSoup(res.text, "html.parser")
+
+            total_a = 0
+            matched_a = 0
+            all_hrefs_sample = []
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 if href.startswith("javascript"):
                     continue
+                total_a += 1
+                if len(all_hrefs_sample) < 8:
+                    all_hrefs_sample.append(href)
                 if not _looks_like_product_url(href):
                     continue
+                matched_a += 1
                 if href.startswith("/"):
                     base = "/".join(cat_url.split("/")[:3])
                     href = base + href
@@ -392,6 +460,15 @@ def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param
                 if _looks_like_product_url(u):
                     found_urls.add(u)
 
+            # --- DEBUG: bu sayfada kac <a href> vardi, kaci "urun linki" sayildi? ---
+            _dbg(f"[category] {page_url}: toplam <a href>={total_a}, urun-benzeri-eslesen={matched_a}, "
+                 f"script-regex-bulunan={len(script_urls)}")
+            if total_a > 0 and matched_a == 0:
+                _dbg(f"[category] HICBIR HREF ESLESMEDI, ornek href'ler: {all_hrefs_sample}")
+            elif total_a == 0:
+                _dbg(f"[category] Sayfada hic <a href> etiketi bulunamadi (JS ile mi render ediliyor?). "
+                     f"HTML ilk 300 karakter: {res.text[:300]!r}")
+
             new_count = len(found_urls) - before_count
             if new_count == 0:
                 consecutive_empty += 1
@@ -400,9 +477,11 @@ def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param
                 consecutive_empty = 0
 
             time.sleep(0.8)
-        except Exception:
+        except Exception as e:
+            _dbg(f"[category] HATA {cat_url} sayfa {page}: {e}")
             break
 
+    _dbg(f"[category] {cat_url}: TOPLAM bulunan urun linki={len(found_urls)}")
     return list(found_urls)
 
 
@@ -687,6 +766,7 @@ def process_store(store):
 
     base_domain = "https://" + store["start_urls"][0].split("/")[2]
     product_urls = set(try_sitemap_urls(scraper, base_domain, stats))
+    _dbg(f"[{store['name']}] sitemap sonrasi link sayisi: {len(product_urls)}")
 
     if not product_urls:
         print(f"[{store['name']}] Sitemap bulunamadi, kategori sayfalari taranacak")
