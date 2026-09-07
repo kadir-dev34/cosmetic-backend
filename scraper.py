@@ -14,6 +14,12 @@ import warnings
 from dotenv import load_dotenv
 from supabase import create_client
 
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 # Log Ayarları
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -29,8 +35,7 @@ warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 # denemek yerine (ki son 3 turda tam olarak bunun yeni regresyonlara
 # yol açtığını gördük), aşağıdaki DEBUG çıktıları bir sonraki
 # çalıştırmada ham veriyi (kaç <loc>/<a href> bulundu, örnek URL'ler,
-# 404/403 sayfasının gerçek içeriği) doğrudan log'a yazar. Bu sayede
-# kör tahmin yerine kanıta dayalı düzeltme yapılabilir.
+# 404/403 sayfasının gerçek içeriği) doğrudan log'a yazar.
 # İşiniz bitince DEBUG_DIAGNOSTICS = False yaparak log hacmini
 # eski haline getirebilirsiniz.
 # ============================================================
@@ -77,6 +82,11 @@ RETAILERS = [
         "max_pages": 15,
         # Sephora korumali bir site (tum urun sayfalarinda 403 aliniyor) -
         # worker sayisini artirmak sorunu cozmez, sadece 403 sayisini artirir.
+        # Playwright'a BILEREK gecirmedik: Sephora'nin korumasi buyuk
+        # ihtimalle Akamai/PerimeterX/Datadome tarzi davranissal bir sistem
+        # ve tek basina "gercek tarayici" render etmek bunu asmaya yetmeyebilir
+        # (genelde proxy rotasyonu + stealth eklentisi de gerekir). Bu riskli/
+        # belirsiz yatirimi simdilik Kozmela/Boyner sonucu netlesince ele aliyoruz.
         "concurrent_workers": 1
     },
     {
@@ -85,7 +95,15 @@ RETAILERS = [
         "start_urls": ["https://www.boyner.com.tr/kozmetik-c-10", "https://www.boyner.com.tr/parfum-c-1001"],
         "pagination_param": "page",
         "max_pages": 15,
-        "concurrent_workers": 2
+        # DENEME: Boyner'da ayni sitemap basari sayisiyla (7) ürün linki
+        # 528'den 3'e dustu -- kod tarafinda goze carpan bir degisiklik
+        # olmadigindan, en olasi aciklama urun linklerinin artik/hep
+        # JavaScript ile render edilmesi. Playwright ile gercek DOM'u
+        # JS calistiktan sonra okuyoruz.
+        "use_playwright": True,
+        # Playwright tek bir tarayici uzerinden kilitli (lock) calisiyor,
+        # yani thread sayisini artirmanin bir faydasi yok -- net olsun diye 1.
+        "concurrent_workers": 1
     },
     {
         "name": "Kozmela",
@@ -93,7 +111,11 @@ RETAILERS = [
         "start_urls": ["https://www.kozmela.com/cilt-bakimi", "https://www.kozmela.com/makyaj"],
         "pagination_param": "page",
         "max_pages": 15,
-        "concurrent_workers": 2
+        # DENEME: Kozmela'da sitemap 404 donuyor VE kategori sayfasi
+        # taramasi 0 link buluyordu -- ayni JS-render supheli. Playwright
+        # ile deniyoruz.
+        "use_playwright": True,
+        "concurrent_workers": 1
     }
 ]
 
@@ -105,6 +127,13 @@ CONCURRENT_WORKERS = 1
 # (örn. eski Gratis 3 saat sürme sorunu) diğer mağazaların hiç taranamamasına
 # (Sephora'nın "cancelled" olmasına) yol açmasını engeller.
 MAX_STORE_RUNTIME_SECONDS = int(os.getenv("MAX_STORE_RUNTIME_SECONDS", 60 * 40))  # varsayilan 40 dakika
+
+# Playwright bekleme sureleri (JS render/lazy-load icin). Site gercekten
+# JS-agir ise bu sureleri artirmak gerekebilir -- DEBUG loglarinda
+# "toplam <a href>=0" gorurseniz once bu degerleri yukseltmeyi deneyin.
+PLAYWRIGHT_CATEGORY_WAIT_MS = 2500
+PLAYWRIGHT_PRODUCT_WAIT_MS = 1500
+PLAYWRIGHT_NAV_TIMEOUT_MS = 20000
 
 
 def get_scraper():
@@ -138,6 +167,101 @@ def get_thread_scraper(fresh=False):
     return _thread_local.scraper
 
 
+# ============================================================
+# PLAYWRIGHT DESTEĞİ (Kozmela / Boyner icin)
+# ------------------------------------------------------------
+# Tek bir Chromium ornegi tum calistirma boyunca acik tutulur (her
+# istekte yeniden baslatmak cok yavas olurdu). sync_playwright API'si
+# thread-safe DEGILDIR, bu yuzden erisimi bir kilitle (lock) seri
+# hale getiriyoruz -- zaten bu magazalar icin concurrent_workers=1
+# ayarli, yani pratikte ek bir yavaslama yaratmiyor.
+# ============================================================
+_playwright_lock = threading.Lock()
+_playwright_state = {"pw": None, "browser": None}
+
+
+def _ensure_playwright_browser():
+    if not PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError(
+            "playwright paketi kurulu degil. Kurulum icin: "
+            "'pip install playwright' ve ardindan 'playwright install --with-deps chromium' calistirin."
+        )
+    with _playwright_lock:
+        if _playwright_state["browser"] is None:
+            _dbg("[playwright] Chromium baslatiliyor...")
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"]
+            )
+            _playwright_state["pw"] = pw
+            _playwright_state["browser"] = browser
+    return _playwright_state["browser"]
+
+
+def close_playwright():
+    with _playwright_lock:
+        if _playwright_state["browser"] is not None:
+            try:
+                _playwright_state["browser"].close()
+            except Exception:
+                pass
+        if _playwright_state["pw"] is not None:
+            try:
+                _playwright_state["pw"].stop()
+            except Exception:
+                pass
+        _playwright_state["browser"] = None
+        _playwright_state["pw"] = None
+
+
+class _PlaywrightResponse:
+    """cloudscraper/requests Response benzeri minimal sarmalayici -- boylece
+    parse_product_page ve process_store icindeki mevcut kod (p_res.text,
+    p_res.status_code) DEGISMEDEN calismaya devam eder."""
+
+    def __init__(self, text, status_code):
+        self.text = text
+        self.status_code = status_code if status_code is not None else 200
+        self.headers = {}
+
+
+def fetch_page_playwright(url, referer=None, wait_ms=2000, timeout_ms=None):
+    """Gercek Chromium ile sayfayi acar, JS calisimini bekler, render
+    edilmis HTML'i dondurur. Donus: (url, html_or_None, status_or_None, error_or_None)"""
+    timeout_ms = timeout_ms or PLAYWRIGHT_NAV_TIMEOUT_MS
+    browser = _ensure_playwright_browser()
+    with _playwright_lock:
+        context = None
+        try:
+            extra_headers = {"Accept-Language": "tr-TR,tr;q=0.9"}
+            if referer:
+                extra_headers["Referer"] = referer
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                locale="tr-TR",
+                viewport={"width": 1366, "height": 900},
+                extra_http_headers=extra_headers,
+            )
+            page = context.new_page()
+            response = page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+            # Lazy-load / JS render icin ek bekleme. Sayfaya gore
+            # PLAYWRIGHT_CATEGORY_WAIT_MS / PLAYWRIGHT_PRODUCT_WAIT_MS
+            # degerleri cagiran fonksiyondan gecilir.
+            page.wait_for_timeout(wait_ms)
+            html = page.content()
+            status = response.status if response else None
+            return url, html, status, None
+        except Exception as e:
+            return url, None, None, str(e)
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
+
 # ------------------------------------------------------------------
 # BUG (Sephora 403): Tum urun sayfalarina yapilan istekler 403 donuyordu
 # (sitemap istekleri 200 donuyor, yani engel sadece urun sayfalarinda).
@@ -151,7 +275,16 @@ def get_thread_scraper(fresh=False):
 # kesin cozmez -- cozmezse gercek ihtiyac headless bir tarayicidir
 # (orn. Playwright) ve bunu ayrica not ediyoruz.
 # ------------------------------------------------------------------
-def fetch_product_page(url, referer=None, min_delay=1.0, max_delay=2.5):
+def fetch_product_page(url, referer=None, min_delay=1.0, max_delay=2.5, use_playwright=False):
+    if use_playwright:
+        # Playwright zaten yavas ve tek tarayici uzerinden kilitli
+        # (seri) calisiyor; buraya ek rastgele bekleme eklemek sadece
+        # gereksiz yavasliktir.
+        _, html, status, err = fetch_page_playwright(url, referer=referer, wait_ms=PLAYWRIGHT_PRODUCT_WAIT_MS)
+        if err or html is None:
+            return url, None, err or "playwright: sayfa alinamadi"
+        return url, _PlaywrightResponse(html, status), None
+
     time.sleep(random.uniform(min_delay, max_delay))
     try:
         scraper = get_thread_scraper()
@@ -325,7 +458,6 @@ def parse_sitemap_url(sub_url, product_url_pattern, stats):
         sub_res = scraper.get(sub_url, timeout=12)
         stats["status_codes"][f"sitemap:{sub_res.status_code}"] = stats["status_codes"].get(f"sitemap:{sub_res.status_code}", 0) + 1
 
-        # --- DEBUG: alt-sitemap gercekten ne donduruyor? ---
         _dbg(f"[sitemap-sub] {sub_url} -> {sub_res.status_code}, "
              f"Content-Type={sub_res.headers.get('Content-Type')}, boyut={len(sub_res.text)}b")
 
@@ -333,7 +465,6 @@ def parse_sitemap_url(sub_url, product_url_pattern, stats):
             sub_locs = re.findall(r"<loc>([^<]+)</loc>", sub_res.text)
             matched = [loc for loc in sub_locs if product_url_pattern.search(loc)]
             found.update(matched)
-            # --- DEBUG: pattern kac tanesini eslestirdi, eslesmeyenler nasil gorunuyor? ---
             _dbg(f"[sitemap-sub] {sub_url}: toplam <loc>={len(sub_locs)}, pattern-eslesen={len(matched)}")
             if sub_locs and not matched:
                 _dbg(f"[sitemap-sub] HIC ESLESME YOK, ornek loc'lar: {sub_locs[:5]}")
@@ -357,7 +488,6 @@ def try_sitemap_urls(scraper, base_domain, stats):
             res = scraper.get(base_domain + path, timeout=12)
             stats["status_codes"][f"sitemap:{res.status_code}"] = stats["status_codes"].get(f"sitemap:{res.status_code}", 0) + 1
 
-            # --- DEBUG: bu istek gercekte ne donduruyor (durum + govde onizleme)? ---
             _dbg(f"[sitemap] {base_domain + path} -> {res.status_code}, "
                  f"Content-Type={res.headers.get('Content-Type')}, boyut={len(res.text)}b")
             if res.status_code != 200:
@@ -369,7 +499,6 @@ def try_sitemap_urls(scraper, base_domain, stats):
             sub_sitemaps = re.findall(r"<loc>([^<]+\.xml[^<]*)</loc>", res.text)
             locs = re.findall(r"<loc>([^<]+)</loc>", res.text)
 
-            # --- DEBUG: index sitemap'inde kac <loc> var, kac tanesi urun sayilip yakalandi? ---
             _dbg(f"[sitemap] {path}: toplam <loc>={len(locs)}, alt-sitemap sayisi={len(sub_sitemaps)}")
             if locs[:5]:
                 _dbg(f"[sitemap] ornek loc'lar: {locs[:5]}")
@@ -416,7 +545,7 @@ def _looks_like_product_url(href):
     return any(k in href for k in ["-p-", "/p/", "urun", "product", ".html", "-pr-", "/pr/", "/collections/"])
 
 
-def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param="page", max_pages=15):
+def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param="page", max_pages=15, use_playwright=False):
     found_urls = set()
     consecutive_empty = 0
 
@@ -424,18 +553,30 @@ def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param
         try:
             sep = "&" if "?" in cat_url else "?"
             page_url = cat_url if page == 1 else f"{cat_url}{sep}{pagination_param}={page}"
-            res = scraper.get(page_url, timeout=12)
-            stats["status_codes"][res.status_code] = stats["status_codes"].get(res.status_code, 0) + 1
 
-            # --- DEBUG: kategori sayfasi gercekte ne donduruyor? ---
-            _dbg(f"[category] {page_url} -> {res.status_code}, boyut={len(res.text)}b")
-
-            if res.status_code != 200:
-                _dbg(f"[category] basarisiz yanit govdesi (ilk 200 karakter): {res.text[:200]!r}")
-                break
+            if use_playwright:
+                _, html, status, err = fetch_page_playwright(page_url, referer=cat_url, wait_ms=PLAYWRIGHT_CATEGORY_WAIT_MS)
+                if err or html is None:
+                    _dbg(f"[category-pw] HATA {page_url}: {err}")
+                    break
+                status_key = status if status is not None else "pw:unknown"
+                stats["status_codes"][status_key] = stats["status_codes"].get(status_key, 0) + 1
+                _dbg(f"[category-pw] {page_url} -> {status}, render sonrasi boyut={len(html)}b")
+                if status is not None and status != 200:
+                    _dbg(f"[category-pw] basarisiz durum kodu, ilk 200 karakter: {html[:200]!r}")
+                    break
+                res_text = html
+            else:
+                res = scraper.get(page_url, timeout=12)
+                stats["status_codes"][res.status_code] = stats["status_codes"].get(res.status_code, 0) + 1
+                _dbg(f"[category] {page_url} -> {res.status_code}, boyut={len(res.text)}b")
+                if res.status_code != 200:
+                    _dbg(f"[category] basarisiz yanit govdesi (ilk 200 karakter): {res.text[:200]!r}")
+                    break
+                res_text = res.text
 
             before_count = len(found_urls)
-            soup = BeautifulSoup(res.text, "html.parser")
+            soup = BeautifulSoup(res_text, "html.parser")
 
             total_a = 0
             matched_a = 0
@@ -455,19 +596,20 @@ def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param
                     href = base + href
                 found_urls.add(href)
 
-            script_urls = re.findall(r'https?://[^\s"\'<>]+(?:-p-|-pr-|/p/|/pr/|urun)[^\s"\'<>]*', res.text)
+            script_urls = re.findall(r'https?://[^\s"\'<>]+(?:-p-|-pr-|/p/|/pr/|urun)[^\s"\'<>]*', res_text)
             for u in script_urls:
                 if _looks_like_product_url(u):
                     found_urls.add(u)
 
-            # --- DEBUG: bu sayfada kac <a href> vardi, kaci "urun linki" sayildi? ---
-            _dbg(f"[category] {page_url}: toplam <a href>={total_a}, urun-benzeri-eslesen={matched_a}, "
+            tag = "[category-pw]" if use_playwright else "[category]"
+            _dbg(f"{tag} {page_url}: toplam <a href>={total_a}, urun-benzeri-eslesen={matched_a}, "
                  f"script-regex-bulunan={len(script_urls)}")
             if total_a > 0 and matched_a == 0:
-                _dbg(f"[category] HICBIR HREF ESLESMEDI, ornek href'ler: {all_hrefs_sample}")
+                _dbg(f"{tag} HICBIR HREF ESLESMEDI, ornek href'ler: {all_hrefs_sample}")
             elif total_a == 0:
-                _dbg(f"[category] Sayfada hic <a href> etiketi bulunamadi (JS ile mi render ediliyor?). "
-                     f"HTML ilk 300 karakter: {res.text[:300]!r}")
+                _dbg(f"{tag} Sayfada hic <a href> etiketi bulunamadi"
+                     f"{' (JS ile mi render ediliyor?)' if not use_playwright else ''}. "
+                     f"HTML ilk 300 karakter: {res_text[:300]!r}")
 
             new_count = len(found_urls) - before_count
             if new_count == 0:
@@ -476,7 +618,8 @@ def extract_product_urls_from_category(scraper, cat_url, stats, pagination_param
             else:
                 consecutive_empty = 0
 
-            time.sleep(0.8)
+            if not use_playwright:
+                time.sleep(0.8)
         except Exception as e:
             _dbg(f"[category] HATA {cat_url} sayfa {page}: {e}")
             break
@@ -507,54 +650,17 @@ def _is_valid_price_context(el):
     return not any(bad in context for bad in PRICE_BLACKLIST_WORDS)
 
 
-# ------------------------------------------------------------------
-# BUG FIX #2b (Kozmela "799 TL" hatasi devam ediyordu): Onceki
-# _is_valid_price_context() blacklist'i sadece bilinen kargo/taksit
-# banner'larini yakaliyordu. Ama loglar gosterdi ki (run #41) 220
-# urunun ~153'u yine BIREBIR AYNI fiyatla (799.0 TL) kaydedildi --
-# tirnak makasi, sampuan, fondoten, biberon gibi tamamen farkli
-# urunler. Bu, sitede her sayfada ayni sekilde goruntulenen (ama
-# blacklist kelimelerini icermeyen) baska bir sabit widget'in genis
-# "[class*='price']" secicisiyle yakalanmasindan kaynaklaniyor olmali.
-#
-# Blacklist kelime tahmin etmek yerine, DAVRANISSAL bir anomali
-# kontrolu ekliyoruz: ayni fiyat degeri, en genis/en son care secici
-# ("[class*='price']") uzerinden ayni store calistirmasi icinde N'den
-# fazla kez tekrar ederse, bu deger artik guvenilmez sayilir ve o
-# urun icin fiyat bulunamadi kabul edilir (urun atlanir, DB'ye yanlis
-# fiyat yazilmaz). Gercek urunlerde ayni fiyatin birkac kez tekrar
-# etmesi normaldir (ayni fiyatli farkli renkler vb.) - esik bu yuzden
-# yuksek tutuldu (10), asil amac 153/220 gibi kitlesel tekrari yakalamak.
-# ------------------------------------------------------------------
 BROAD_PRICE_REPEAT_THRESHOLD = 10
 _broad_price_counts_lock = threading.Lock()
 
 
 def _register_broad_price_and_check(price_counts, price):
-    """price_counts: process_store'dan gelen, store'a ozel paylasimli dict.
-    True donerse fiyat guvenilir (kullanilabilir), False donerse suspicious."""
     with _broad_price_counts_lock:
         count = price_counts.get(price, 0) + 1
         price_counts[price] = count
         return count <= BROAD_PRICE_REPEAT_THRESHOLD
 
 
-# ------------------------------------------------------------------
-# BUG FIX #1 (Gratis içerik/ingredient sorunu): Eski kod, "İçindekiler"
-# veya "Ingredients" kelimesini içeren İLK elementi (find_all sırası
-# gereği genelde en dıştaki büyük wrapper div) kabul edip metnini
-# olduğu gibi INCI listesi olarak kaydediyordu. Bu da yorumları, iade
-# politikasını, firma adresini vs. "ingredient" olarak DB'ye yazıyordu
-# ve binlerce gereksiz satır/istek yüzünden scraper'ı ciddi yavaşlatıyordu.
-#
-# Yeni yaklaşım:
-#  - Eşleşen tüm adaylar toplanır, en KISA (en spesifik) aday seçilir.
-#  - Kara liste kelimeleri (iade, yorum, kargo, sipariş vb.) içeren
-#    adaylar elenir.
-#  - Bir INCI listesinin virgülle ayrılmış parçaları kısa olmalıdır;
-#    ortalama parça uzunluğu ve kelime sayısı bir "paragraf" gibi
-#    görünüyorsa aday reddedilir.
-# ------------------------------------------------------------------
 INGREDIENT_BLACKLIST_WORDS = [
     "iade", "kolay i̇ade", "değerlendirme", "yorum", "kargo", "taksit",
     "hesabım", "sipariş", "ürün kodu", "ürün barkodu", "menşei",
@@ -601,16 +707,6 @@ def extract_ingredients(soup):
     return candidates[0]
 
 
-# ------------------------------------------------------------------
-# BUG FIX #3 (Boyner/Kozmela "kategori sayfası = ürün" sorunu):
-# KNOWN_NON_PRODUCT_NAMES yalnızca tam eşleşen birkaç sabit isme
-# bakıyordu ("Bakım Ürünleri Modelleri" gibi türetilmiş isimler
-# kaçıyordu). Şimdi "Modelleri/Ürünleri/Ürünler" gibi tipik
-# kategori-sayfası son ekleri regex ile de yakalanıyor. Ayrıca
-# JSON-LD'de "Product" şeması bulunamadıysa (yani isim H1/og:title
-# fallback'inden geldiyse), sayfada gerçek bir "Sepete Ekle" butonu
-# olup olmadığı da kontrol ediliyor.
-# ------------------------------------------------------------------
 KNOWN_NON_PRODUCT_NAMES = {
     "süpermarket", "markalar", "makyaj", "cilt bakım", "saç bakım",
     "temizleme ürünleri", "kağıt ürünleri", "tekstil ürünleri",
@@ -626,9 +722,8 @@ CATEGORY_NAME_SUFFIX_PATTERN = re.compile(
 
 def parse_product_page(soup, p_res, price_counts=None):
     name, brand_name, price, image_url, inci_text = None, "Genel", None, None, None
-    is_confirmed_product = False  # JSON-LD'de @type=Product bulunduysa True
+    is_confirmed_product = False
 
-    # 1. JSON-LD Parsing
     try:
         scripts = soup.find_all("script", type="application/ld+json")
         for script in scripts:
@@ -657,7 +752,6 @@ def parse_product_page(soup, p_res, price_counts=None):
     except Exception:
         pass
 
-    # 2. HTML Fallback
     if not name:
         h1 = soup.select_one("h1")
         if h1: name = clean_text(h1.get_text())
@@ -677,29 +771,11 @@ def parse_product_page(soup, p_res, price_counts=None):
     ):
         return None, None, None, None, None
 
-    # ------------------------------------------------------------------
-    # BUG FIX #3b (Boyner asiri filtreleme): JSON-LD ile dogrulanmayan
-    # sayfalarda "gercek urun mu" testi olarak SADECE "Sepete Ekle"
-    # buton/metni araniyordu, bulunamazsa sayfa TAMAMEN reddediliyordu.
-    # Run #41'de Boyner'da 528 linkten 527'si bu yuzden atlandi -- Boyner'in
-    # gercek HTML yapisi bu iki secicinin hicbirine uymuyor (buton JS ile
-    # sonradan render ediliyor olabilir, farkli bir class ismi kullaniyor
-    # olabilir vb.). Bu kontrolu SERTCE reddetmek yerine bir "guven puani"
-    # sinyaline indirgiyoruz: cart isareti yoksa direkt eleriz ama SADECE
-    # asagidaki fiyat kontrolunde de gecerli bir fiyat bulunamazsa (zaten
-    # process_store'da "price is None -> atla" kontrolu var). Boylece
-    # kategori sayfalari (fiyatsiz) yine elenir, ama fiyati olan gercek
-    # urunler artik sirf "sepete ekle" metni bulunamadi diye kaybedilmez.
-    # ------------------------------------------------------------------
     has_weak_cart_signal = True
     if not is_confirmed_product:
         has_cart_text = soup.find(string=re.compile(r"sepete ekle|add to cart|satın al", re.IGNORECASE))
         has_cart_button = soup.select_one("button[class*='cart'], button[class*='sepet'], [class*='add-to-cart']")
         has_weak_cart_signal = bool(has_cart_text or has_cart_button)
-        # Ne cart isareti ne de JSON-LD var VE isim de zayifsa (tek/iki
-        # kelime, buyuk ihtimalle bir menu/breadcrumb basligi), o zaman
-        # dogrudan ele -- bu hala eski "kategori sayfasi" hatasina karsi
-        # bir güvenlik agi, ama artik tek basina yeterli bir red sebebi degil.
         if not has_weak_cart_signal and word_count <= 3:
             return None, None, None, None, None
 
@@ -711,12 +787,9 @@ def parse_product_page(soup, p_res, price_counts=None):
             parts = name.split()
             if len(parts) > 1: brand_name = parts[0]
 
-    # Sephora bitişik isim düzeltmesini uygula
     name = fix_sephora_title(brand_name, name)
 
     if not price:
-        # "[class*='price']" en genis/son care secici -- bir onceki Kozmela
-        # "799 TL" hatasinin kaynagi buydu. Buna ozel anomali kontrolu uygulanir.
         broad_selector = "[class*='price']"
         priority_selectors = [
             ".price-sales", ".price-undiscounted", ".discount-price", ".current-price",
@@ -731,10 +804,6 @@ def parse_product_page(soup, p_res, price_counts=None):
                     continue
                 if sel == broad_selector and price_counts is not None:
                     if not _register_broad_price_and_check(price_counts, p):
-                        # Bu fiyat, ayni calistirmada esik degerinden fazla
-                        # tekrar etti -> muhtemelen sabit bir widget/banner,
-                        # gercek urun fiyati degil. Bu adayi reddet, sonraki
-                        # elemana/seciciye gec.
                         continue
                 price = p
                 break
@@ -756,6 +825,10 @@ def parse_product_page(soup, p_res, price_counts=None):
 
 def process_store(store):
     print(f"\n==================== {store['name']} Taranıyor ====================")
+    use_playwright = store.get("use_playwright", False)
+    if use_playwright:
+        _dbg(f"[{store['name']}] Playwright modu AKTIF")
+
     scraper = get_scraper()
     retailer_id = get_or_create_retailer(store["name"], store["slug"])
 
@@ -765,13 +838,18 @@ def process_store(store):
     max_pages = store.get("max_pages", 15)
 
     base_domain = "https://" + store["start_urls"][0].split("/")[2]
+
+    # Sitemap XML'i statiktir, JS render gerektirmez -- her zaman
+    # cloudscraper ile denenir (Playwright store'lar icin de).
     product_urls = set(try_sitemap_urls(scraper, base_domain, stats))
     _dbg(f"[{store['name']}] sitemap sonrasi link sayisi: {len(product_urls)}")
 
     if not product_urls:
         print(f"[{store['name']}] Sitemap bulunamadi, kategori sayfalari taranacak")
         for cat_url in store["start_urls"]:
-            urls = extract_product_urls_from_category(scraper, cat_url, stats, pagination_param, max_pages)
+            urls = extract_product_urls_from_category(
+                scraper, cat_url, stats, pagination_param, max_pages, use_playwright=use_playwright
+            )
             for u in urls: product_urls.add(u)
 
     product_urls = list(product_urls)
@@ -779,21 +857,15 @@ def process_store(store):
 
     idx = 0
     start_time = time.time()
-    price_counts = {}  # BUG FIX #2b: Kozmela "799 TL" anomali kontrolu icin store'a ozel sayac
+    price_counts = {}
     workers = store.get("concurrent_workers", CONCURRENT_WORKERS)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_url = {
-            executor.submit(fetch_product_page, url, referer=base_domain): url for url in product_urls
+            executor.submit(fetch_product_page, url, referer=base_domain, use_playwright=use_playwright): url
+            for url in product_urls
         }
 
         for future in as_completed(future_to_url):
-            # BUG FIX #5 (Sephora hiç taranamadan iptal olması): Bir mağaza
-            # çok uzun sürerse (eskiden Gratis ~3 saat sürüp job'ı tükettiği
-            # için Sephora hiç başlayamadan cancel oldu), zaman sınırına
-            # ulaşınca kalan ürünler atlanıp mevcut sonuçlarla devam edilir.
-            # Not: Bu script-seviyesinde bir güvenlik önlemidir; asıl önerilen
-            # çözüm, GitHub Actions workflow'unda mağazaları paralel matrix
-            # job olarak, her birine ayrı timeout-minutes vererek çalıştırmaktır.
             if time.time() - start_time > MAX_STORE_RUNTIME_SECONDS:
                 logging.warning(
                     f"[{store['name']}] Zaman siniri ({MAX_STORE_RUNTIME_SECONDS}s) asildi. "
@@ -841,10 +913,6 @@ def process_store(store):
                 unique_slug = f"{slug}-{store['slug']}"
                 existing = supabase.table("products").select("id, name").eq("slug", unique_slug).limit(1).execute()
 
-                # BUG FIX #4 (slug çakışması): Aynı slug'a sahip ama adı
-                # tamamen farklı bir ürün varsa (yanlışlıkla iki farklı
-                # sayfa aynı slug'ı üretmiş olabilir), üzerine yazmak yerine
-                # URL'e dayalı benzersiz bir slug ile yeni kayıt oluştur.
                 if existing.data:
                     existing_name = (existing.data[0].get("name") or "").strip().lower()
                     if existing_name and existing_name != name.strip().lower():
@@ -904,13 +972,18 @@ def main():
         stores_to_run = RETAILERS
 
     overall = {}
-    for store in stores_to_run:
-        try:
-            overall[store["name"]] = process_store(store)
-            time.sleep(2)
-        except Exception as e:
-            print(f"{store['name']} atlandı: {e}")
-            continue
+    try:
+        for store in stores_to_run:
+            try:
+                overall[store["name"]] = process_store(store)
+                time.sleep(2)
+            except Exception as e:
+                print(f"{store['name']} atlandı: {e}")
+                continue
+    finally:
+        # Playwright kullanildiysa tarayiciyi mutlaka kapat (kaynak sizintisi
+        # olmasin diye başarılı/başarısız her durumda calisir).
+        close_playwright()
 
     print("\n==================== GENEL ÖZET ====================")
     for name, s in overall.items():
