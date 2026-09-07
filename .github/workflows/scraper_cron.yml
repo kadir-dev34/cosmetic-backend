@@ -43,24 +43,7 @@ jobs:
       - name: Paketleri Yukle
         run: |
           python -m pip install --upgrade pip
-          pip install cloudscraper beautifulsoup4 python-dotenv supabase playwright
-      - name: Playwright Tarayicisini Kur (sadece Kozmela/Boyner icin)
-        # Kozmela ve Boyner'da urun linki sayisinin (528->3, 220->0)
-        # aciklanamayan sekilde cokmesi, bu sitelerin urun linklerini
-        # JavaScript ile sonradan render ediyor olabilecegini dusundurdu.
-        # scraper.py bu iki magaza icin artik gercek bir Chromium
-        # tarayici (Playwright) kullaniyor; bu adim o tarayicinin
-        # ikili (binary) dosyasini indirir. pip ile kurulan "playwright"
-        # paketi sadece Python arayuzudur, tarayicinin kendisini
-        # icermez - bu adim olmadan Playwright cagrilari RuntimeError
-        # ile patlar.
-        #
-        # Gratis ve Sephora bunu kullanmiyor (Sephora icin ayri, daha
-        # riskli bir konu; Gratis'e zaten gerek yok), bu yuzden CI
-        # dakikasini bosa harcamamak icin sadece bu iki magazada
-        # calistiriyoruz.
-        if: matrix.store == 'kozmela' || matrix.store == 'boyner'
-        run: playwright install --with-deps chromium
+          pip install cloudscraper beautifulsoup4 python-dotenv supabase
       - name: Botu Calistir (${{ matrix.store }})
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
